@@ -1,0 +1,2 @@
+{"action": "ALERT_LOG", "timestamp": "2026-03-05T12:00:48.330816", "summary": {"generated_at": "2026-03-05T12:00:48.329807", "alert_count": 0, "src_ip_unique": 0, "by_rule": {}, "by_severity": {}}, "alerts_sample": []}
+{"action": "ACTION_EXECUTION", "rows": [{"timestamp": "2026-03-05T12:00:48.330816", "action_type": "ALERT_LOG", "status": "success", "target": "data\\response_audit_20260305.jsonl", "detail": "logged 0 alerts"}], "timestamp": "2026-03-05T12:00:48.341753"}
