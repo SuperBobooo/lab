@@ -16,6 +16,41 @@ SEVERITY_WEIGHT: Dict[str, int] = {
 }
 
 
+def _compute_risk_score(max_severity: str, rule_count: int, alert_count: int, duration_s: float) -> float:
+    """
+    Compute incident risk score with better spread (avoid score saturation at 100).
+
+    Components:
+    - severity base: low/medium/high
+    - rule diversity bonus
+    - alert volume bonus (log-scaled)
+    - persistence bonus (longer incident duration)
+    """
+    base_map = {"low": 30.0, "medium": 55.0, "high": 72.0}
+    base = base_map.get(max_severity, 30.0)
+
+    rule_bonus = min(18.0, max(0, int(rule_count) - 1) * 6.0)
+    volume_bonus = min(16.0, (max(0, int(alert_count)) ** 0.5) * 3.2)
+    persistence_bonus = min(10.0, max(0.0, float(duration_s)) / 60.0)
+
+    return round(min(100.0, base + rule_bonus + volume_bonus + persistence_bonus), 2)
+
+
+def _infer_stage_from_rules(rules: list[str]) -> str:
+    text = ",".join([str(r).upper() for r in rules])
+    if "PORT_SCAN" in text or "ARP_SCAN" in text:
+        return "侦察"
+    if "BRUTE_FORCE" in text:
+        return "尝试入侵"
+    if "ANOMALOUS_DNS" in text or "PERIODIC_BEACON" in text:
+        return "控制通信"
+    if "TRAFFIC_BURST" in text:
+        return "影响/外传"
+    if "ARP_SPOOF" in text or "ARP_MITM_SUSPECT" in text:
+        return "中间人风险"
+    return "综合异常"
+
+
 def _normalize_alerts(alerts_df: pd.DataFrame) -> pd.DataFrame:
     required = {"timestamp", "rule_name", "severity", "src_ip", "dst_ip"}
     missing = required - set(alerts_df.columns)
@@ -61,6 +96,7 @@ def build_incidents(
                 "rule_count",
                 "max_severity",
                 "risk_score",
+                "stage",
                 "rules",
                 "event_chain",
             ]
@@ -80,6 +116,7 @@ def build_incidents(
                 "rule_count",
                 "max_severity",
                 "risk_score",
+                "stage",
                 "rules",
                 "event_chain",
             ]
@@ -115,19 +152,14 @@ def build_incidents(
             max_sev_weight = int(segment["severity"].map(SEVERITY_WEIGHT).max())
             max_severity = {v: k for k, v in SEVERITY_WEIGHT.items()}.get(max_sev_weight, "low")
 
-            # Risk score: weighted by severity and rule diversity.
+            # Risk score with better spread for prioritization.
             rule_count = len(rules)
             alert_count = int(len(segment))
-            risk_score = float(
-                min(
-                    100.0,
-                    round(
-                        max_sev_weight * 20
-                        + rule_count * 10
-                        + min(alert_count, 20) * 2,
-                        2,
-                    ),
-                )
+            risk_score = _compute_risk_score(
+                max_severity=max_severity,
+                rule_count=rule_count,
+                alert_count=alert_count,
+                duration_s=duration_s,
             )
             event_chain = " -> ".join(segment.sort_values("timestamp")["rule_name"].astype(str).tolist())
 
@@ -143,6 +175,7 @@ def build_incidents(
                     "rule_count": rule_count,
                     "max_severity": max_severity,
                     "risk_score": risk_score,
+                    "stage": _infer_stage_from_rules(rules),
                     "rules": ", ".join(rules),
                     "event_chain": event_chain,
                 }

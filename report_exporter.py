@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from html import escape
 from typing import Optional, Tuple
+import json
 
 import pandas as pd
 
@@ -21,6 +22,36 @@ def _top_value_counts(df: pd.DataFrame, col: str, topn: int = 5) -> list[tuple[s
     return [(str(k), int(v)) for k, v in vc.items()]
 
 
+def _infer_incident_stage(rules_text: object) -> str:
+    text = str(rules_text).upper()
+    if "PORT_SCAN" in text or "ARP_SCAN" in text:
+        return "侦察"
+    if "BRUTE_FORCE" in text:
+        return "尝试入侵"
+    if "ANOMALOUS_DNS" in text or "PERIODIC_BEACON" in text:
+        return "控制通信"
+    if "TRAFFIC_BURST" in text:
+        return "影响/外传"
+    if "ARP_SPOOF" in text or "ARP_MITM_SUSPECT" in text:
+        return "中间人风险"
+    return "综合异常"
+
+
+def _evidence_summary(evidence_text: object) -> str:
+    text = str(evidence_text or "").strip()
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text[:80]
+    keys = ["window_start", "window_end", "flow_count", "attempt_count", "unique_queries", "nxdomain_count", "arp_packet_count"]
+    parts = [f"{k}={data[k]}" for k in keys if k in data]
+    if not parts:
+        return text[:80]
+    return "; ".join(parts)
+
+
 def build_markdown_report(
     analysis_df: Optional[pd.DataFrame],
     rule_alerts_df: Optional[pd.DataFrame],
@@ -28,6 +59,7 @@ def build_markdown_report(
     incident_df: Optional[pd.DataFrame] = None,
     action_df: Optional[pd.DataFrame] = None,
     llm_assessment: str = "",
+    agent_report_markdown: str = "",
 ) -> str:
     """Build a Markdown security report from current detection results."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -67,7 +99,7 @@ def build_markdown_report(
             lines.append(
                 f"| {row.get('timestamp', '')} | {row.get('rule_name', '')} | "
                 f"{row.get('severity', '')} | {row.get('src_ip', '')} | "
-                f"{row.get('dst_ip', '')} | {str(row.get('evidence', ''))[:80]} |"
+                f"{row.get('dst_ip', '')} | {_evidence_summary(row.get('evidence', ''))} |"
             )
         lines.append("")
 
@@ -75,11 +107,12 @@ def build_markdown_report(
     if incident_df is None or incident_df.empty:
         lines.extend(["- 当前无聚合事件。", ""])
     else:
-        lines.append("| 事件ID | 源IP | 风险分 | 最高级别 | 告警数 | 规则链 |")
-        lines.append("|---|---|---:|---|---:|---|")
+        lines.append("| 事件ID | 阶段 | 源IP | 风险分 | 最高级别 | 告警数 | 规则链 |")
+        lines.append("|---|---|---|---:|---|---:|---|")
         for _, row in incident_df.head(10).iterrows():
+            rules_text = row.get("rules", row.get("event_chain", ""))
             lines.append(
-                f"| {row.get('incident_id', '')} | {row.get('src_ip', '')} | "
+                f"| {row.get('incident_id', '')} | {_infer_incident_stage(rules_text)} | {row.get('src_ip', '')} | "
                 f"{row.get('risk_score', 0)} | {row.get('max_severity', '')} | "
                 f"{row.get('alert_count', 0)} | {row.get('event_chain', '')} |"
             )
@@ -90,11 +123,14 @@ def build_markdown_report(
         lines.extend(["- 无可用流量数据。", ""])
     else:
         lines.append(f"- 流量总数：{len(analysis_df)}")
-        for p, c in _top_value_counts(analysis_df, "protocol", topn=5):
+        for p, c in _top_value_counts(analysis_df, "protocol", topn=8):
             lines.append(f"- 协议 {p}: {c}")
         if "score_iso_norm" in analysis_df.columns:
             mean_score = float(analysis_df["score_iso_norm"].fillna(0).mean())
             lines.append(f"- IsolationForest 平均异常分数：{mean_score:.4f}")
+        if "score_ensemble_norm" in analysis_df.columns:
+            mean_ensemble = float(analysis_df["score_ensemble_norm"].fillna(0).mean())
+            lines.append(f"- 集成模型平均异常分数：{mean_ensemble:.4f}")
         lines.append("")
 
     lines.extend(["## 四、响应动作审计", ""])
@@ -113,15 +149,18 @@ def build_markdown_report(
     lines.extend(
         [
             "## 五、处置建议",
-            "- 优先处理高风险事件对应的源IP，并结合终端日志进行溯源。",
+            "- 优先处置高风险事件对应的源IP，并结合终端日志进行溯源。",
             "- 对 DNS 异常与 ARP 异常同时出现的主机执行网络隔离与资产核验。",
-            "- 对周期性心跳/低慢扫描行为启用更长窗口监控与白名单校验。",
+            "- 对周期性心跳/低慢扫描行为启用更长窗口监控与白名单核验。",
             "",
         ]
     )
 
     if llm_assessment:
         lines.extend(["## 六、LLM 威胁研判", "", llm_assessment.strip(), ""])
+
+    if agent_report_markdown:
+        lines.extend(["## 七、AI Agent 综合研判附录", "", agent_report_markdown.strip(), ""])
 
     return "\n".join(lines)
 
@@ -201,7 +240,6 @@ def markdown_to_pdf_bytes(markdown_text: str) -> Tuple[Optional[bytes], Optional
         if line.startswith("|"):
             table_rows, next_i = _parse_md_table(lines, i)
             if table_rows:
-                # normalize row width
                 width = max(len(r) for r in table_rows)
                 table_rows = [r + [""] * (width - len(r)) for r in table_rows]
                 t = Table(table_rows, repeatRows=1)

@@ -45,6 +45,7 @@ from attack_lab.arp_sample_generator import generate_arp_attack_pcap
 from attack_lab.mutation_sample_generator import generate_mutation_attack_pcap
 from alert_center import build_incidents
 from llm_threat_assessor import generate_threat_assessment
+from agent_assessor import run_agent_assessment
 from rule_engine import (
     detect_anomalous_dns,
     detect_arp_anomalies,
@@ -432,6 +433,98 @@ def load_models():
 
     return models
 
+
+def protocol_display_name(proto: object) -> str:
+    """Normalize protocol names for UI readability."""
+    if proto is None:
+        return "UNKNOWN"
+    p = str(proto).strip().upper()
+    if p == "":
+        return "UNKNOWN"
+    if p.startswith("IP_PROTO_"):
+        try:
+            num = int(p.split("_")[-1])
+        except Exception:
+            return p
+        mapping = {
+            1: "ICMP",
+            2: "IGMP",
+            6: "TCP",
+            17: "UDP",
+            41: "IPV6",
+            47: "GRE",
+            50: "ESP",
+            51: "AH",
+            58: "ICMPV6",
+        }
+        return mapping.get(num, p)
+    return p
+
+
+def summarize_evidence(evidence_text: object) -> str:
+    """Build compact evidence summary for table display."""
+    if evidence_text is None:
+        return ""
+    text = str(evidence_text).strip()
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text[:120] + ("..." if len(text) > 120 else "")
+
+    keys_priority = [
+        "window_start",
+        "window_end",
+        "flow_count",
+        "unique_ports",
+        "attempt_count",
+        "dns_flow_count",
+        "unique_queries",
+        "nxdomain_count",
+        "arp_packet_count",
+        "unique_target_ips",
+        "event_count",
+        "iat_cv",
+    ]
+    parts = []
+    for k in keys_priority:
+        if k in data:
+            parts.append(f"{k}={data[k]}")
+    if not parts:
+        return text[:120] + ("..." if len(text) > 120 else "")
+    return "; ".join(parts)
+
+
+def apply_rule_alert_filters(
+    alerts_df: pd.DataFrame,
+    exclude_src_ips_text: str = "",
+    exclude_rules: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Apply optional post-detection filters to alerts.
+    Defaults keep behavior unchanged.
+    """
+    if alerts_df is None or alerts_df.empty:
+        return alerts_df
+    out = alerts_df.copy()
+
+    if exclude_src_ips_text and "src_ip" in out.columns:
+        src_set = {
+            token.strip()
+            for token in str(exclude_src_ips_text).replace(";", ",").replace("\n", ",").split(",")
+            if token.strip()
+        }
+        if src_set:
+            out = out[~out["src_ip"].astype(str).isin(src_set)].copy()
+
+    if exclude_rules and "rule_name" in out.columns:
+        rule_set = {str(x).strip() for x in exclude_rules if str(x).strip()}
+        if rule_set:
+            out = out[~out["rule_name"].astype(str).isin(rule_set)].copy()
+
+    return out.reset_index(drop=True)
+
 # Sidebar
 with st.sidebar:
     st.title("智能网络威胁检测平台")
@@ -448,6 +541,8 @@ with st.sidebar:
     attack_network_cidr = "192.168.56.0/24"
     mutation_scenario = "stealth_scan"
     mutation_packet_count = 120
+    rule_filter_exclude_src_ips = ""
+    rule_filter_exclude_rules = []
     llm_provider_display = "自动"
     llm_model_name = "auto"
     llm_api_key_input = ""
@@ -555,6 +650,17 @@ with st.sidebar:
         stat_beacon_min_events = st.slider("周期心跳最小事件数", 3, 50, 5, 1)
         stat_beacon_max_cv = st.slider("周期心跳最大IAT变异系数", 0.05, 1.0, 0.2, 0.05)
         incident_correlation_window_s = st.slider("事件聚合窗口（秒）", 30, 1800, 300, 30)
+    with st.expander("规则结果过滤（可选）", expanded=False):
+        rule_filter_exclude_src_ips = st.text_input(
+            "排除源IP（逗号分隔）",
+            value="",
+            help="仅影响规则结果展示/事件聚合，不改变原始抓包与流量构建。",
+        )
+        rule_filter_exclude_rules = st.multiselect(
+            "排除规则类型",
+            ["PORT_SCAN", "BRUTE_FORCE", "ANOMALOUS_DNS", "TRAFFIC_BURST", "PERIODIC_BEACON", "ARP_FLOOD", "ARP_SCAN", "ARP_SPOOF", "ARP_MITM_SUSPECT", "ARP_ABUSE"],
+            default=[],
+        )
 
     with st.expander("LLM 研判参数", expanded=False):
         llm_provider_display = st.selectbox("LLM提供商", ["自动", "DeepSeek", "OpenAI"], index=0)
@@ -617,6 +723,10 @@ if 'log_snapshot_paths' not in st.session_state:
     st.session_state['log_snapshot_paths'] = {}
 if 'llm_assessment' not in st.session_state:
     st.session_state['llm_assessment'] = ""
+if 'agent_report_markdown' not in st.session_state:
+    st.session_state['agent_report_markdown'] = ""
+if 'agent_context' not in st.session_state:
+    st.session_state['agent_context'] = {}
 
 def _render_status_cards(target, current_data_source: str) -> None:
     flow_df = st.session_state.get("flows_df")
@@ -866,12 +976,16 @@ if generate_button or start_capture_button:
                 if recent.empty:
                     return
 
-                protocol_counts = (
-                    recent["protocol"].fillna("UNKNOWN").value_counts()
-                    if "protocol" in recent.columns
-                    else pd.Series(dtype=int)
-                )
-                arp_count = int((recent["protocol"] == "ARP").sum()) if "protocol" in recent.columns else 0
+                # Metrics should reflect cumulative capture, not only preview window.
+                protocol_counts = pd.Series(dtype=int)
+                arp_count = 0
+                if records:
+                    proto_series = (
+                        pd.Series([protocol_display_name(r.get("protocol", "UNKNOWN")) for r in records], dtype="object")
+                        .fillna("UNKNOWN")
+                    )
+                    protocol_counts = proto_series.value_counts()
+                    arp_count = int((proto_series.astype(str) == "ARP").sum())
 
                 with metrics_placeholder.container():
                     c1, c2, c3 = st.columns(3)
@@ -986,8 +1100,13 @@ if generate_button or start_capture_button:
                         beacon_min_events=stat_beacon_min_events,
                         beacon_max_iat_cv=stat_beacon_max_cv
                     )
-                    st.session_state["rule_alerts_df"] = pd.concat(
+                    combined_alerts = pd.concat(
                         [port_scan_alerts, brute_force_alerts, dns_alerts, arp_alerts, stat_alerts], ignore_index=True
+                    )
+                    st.session_state["rule_alerts_df"] = apply_rule_alert_filters(
+                        combined_alerts,
+                        exclude_src_ips_text=rule_filter_exclude_src_ips,
+                        exclude_rules=rule_filter_exclude_rules,
                     )
                     st.session_state["incident_df"] = build_incidents(
                         st.session_state["rule_alerts_df"],
@@ -1097,8 +1216,13 @@ if generate_button or start_capture_button:
                     beacon_min_events=stat_beacon_min_events,
                     beacon_max_iat_cv=stat_beacon_max_cv
                 )
-                st.session_state["rule_alerts_df"] = pd.concat(
+                combined_alerts = pd.concat(
                     [port_scan_alerts, brute_force_alerts, dns_alerts, arp_alerts, stat_alerts], ignore_index=True
+                )
+                st.session_state["rule_alerts_df"] = apply_rule_alert_filters(
+                    combined_alerts,
+                    exclude_src_ips_text=rule_filter_exclude_src_ips,
+                    exclude_rules=rule_filter_exclude_rules,
                 )
                 st.session_state["incident_df"] = build_incidents(
                     st.session_state["rule_alerts_df"],
@@ -1208,8 +1332,13 @@ if generate_button or start_capture_button:
                     beacon_min_events=stat_beacon_min_events,
                     beacon_max_iat_cv=stat_beacon_max_cv
                 )
-                st.session_state["rule_alerts_df"] = pd.concat(
+                combined_alerts = pd.concat(
                     [port_scan_alerts, brute_force_alerts, dns_alerts, arp_alerts, stat_alerts], ignore_index=True
+                )
+                st.session_state["rule_alerts_df"] = apply_rule_alert_filters(
+                    combined_alerts,
+                    exclude_src_ips_text=rule_filter_exclude_src_ips,
+                    exclude_rules=rule_filter_exclude_rules,
                 )
                 st.session_state["incident_df"] = build_incidents(
                     st.session_state["rule_alerts_df"],
@@ -1282,8 +1411,9 @@ if st.session_state.get('pcap_df') is not None:
     protocol_counts = pd.Series(dtype=int)
     arp_count = 0
     if 'protocol' in pcap_df.columns:
-        protocol_counts = pcap_df['protocol'].fillna('UNKNOWN').value_counts()
-        arp_count = int((pcap_df['protocol'] == 'ARP').sum())
+        proto_series = pcap_df['protocol'].map(protocol_display_name).fillna('UNKNOWN')
+        protocol_counts = proto_series.value_counts()
+        arp_count = int((proto_series == 'ARP').sum())
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1375,8 +1505,13 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                 beacon_min_events=stat_beacon_min_events,
                 beacon_max_iat_cv=stat_beacon_max_cv
             )
-            st.session_state['rule_alerts_df'] = pd.concat(
+            combined_alerts = pd.concat(
                 [port_scan_alerts, brute_force_alerts, dns_alerts, arp_alerts, stat_alerts], ignore_index=True
+            )
+            st.session_state['rule_alerts_df'] = apply_rule_alert_filters(
+                combined_alerts,
+                exclude_src_ips_text=rule_filter_exclude_src_ips,
+                exclude_rules=rule_filter_exclude_rules,
             )
             st.session_state['incident_df'] = build_incidents(
                 st.session_state['rule_alerts_df'],
@@ -1400,7 +1535,7 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
     features = generator.get_feature_columns()
 
     # Create tabs for different sections
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "总览",
         "流量分析",
         "异常检测",
@@ -1410,7 +1545,8 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
         "事件中心",
         "ARP 专题",
         "日志中心",
-        "报告导出"
+        "报告导出",
+        "AI Agent"
     ])
 
     # Tab 1: Overview
@@ -1610,8 +1746,35 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
         # Protocol distribution
         st.subheader("协议分布")
 
-        protocol_counts = filtered_df['protocol'].value_counts().reset_index()
-        protocol_counts.columns = ['protocol', 'count']
+        protocol_source_label = "流级（flows_df）"
+        protocol_counts = None
+        pcap_df_for_protocol = st.session_state.get("pcap_df")
+        if (
+            isinstance(pcap_df_for_protocol, pd.DataFrame)
+            and not pcap_df_for_protocol.empty
+            and "protocol" in pcap_df_for_protocol.columns
+        ):
+            protocol_source_label = "包级（pcap_df）"
+            protocol_counts = (
+                pcap_df_for_protocol["protocol"]
+                .map(protocol_display_name)
+                .fillna("UNKNOWN")
+                .astype(str)
+                .value_counts()
+                .reset_index()
+            )
+            protocol_counts.columns = ["protocol", "count"]
+        else:
+            protocol_counts = (
+                filtered_df["protocol"]
+                .map(protocol_display_name)
+                .fillna("UNKNOWN")
+                .value_counts()
+                .reset_index()
+            )
+            protocol_counts.columns = ["protocol", "count"]
+
+        st.caption(f"统计口径：{protocol_source_label}")
 
         pie = alt.Chart(protocol_counts).mark_arc().encode(
             theta=alt.Theta('count:Q'),
@@ -1815,8 +1978,18 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                 if 'attack_type' in anomalies.columns:
                     attack_distribution = anomalies[anomalies['label'] == 'attack']['attack_type'].value_counts()
                     st.markdown("**检测到的攻击类型：**")
-                    for attack_type, count in attack_distribution.items():
-                        st.markdown(f"- {attack_type}: {count}")
+                    if len(attack_distribution) > 0:
+                        for attack_type, count in attack_distribution.items():
+                            st.markdown(f"- {attack_type}: {count}")
+                    else:
+                        # Live/PCAP unlabeled scenario fallback: use rule hits as attack-type proxy.
+                        alerts_df_for_types = st.session_state.get("rule_alerts_df")
+                        if isinstance(alerts_df_for_types, pd.DataFrame) and not alerts_df_for_types.empty:
+                            rule_counts = alerts_df_for_types["rule_name"].astype(str).value_counts()
+                            for rule_name, count in rule_counts.items():
+                                st.markdown(f"- {rule_name}: {count}")
+                        else:
+                            st.markdown("- 当前无可归类攻击类型（实时无标签场景）")
 
         # Anomaly score distribution
         st.subheader("异常分数分布")
@@ -2428,6 +2601,11 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             f"周期最大IAT变异系数 `{stat_beacon_max_cv}`"
         )
         st.caption("使用侧栏“执行规则检测”按钮刷新结果。")
+        if rule_filter_exclude_src_ips or rule_filter_exclude_rules:
+            st.info(
+                f"当前已启用结果过滤：排除源IP `{rule_filter_exclude_src_ips or '无'}`，"
+                f"排除规则 `{','.join(rule_filter_exclude_rules) if rule_filter_exclude_rules else '无'}`。"
+            )
 
         alerts_df = st.session_state.get('rule_alerts_df')
         if alerts_df is None:
@@ -2469,8 +2647,46 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             if selected_src != "全部":
                 details_df = details_df[details_df['src_ip'].astype(str) == selected_src]
 
-            details_df = details_df.sort_values(by=["timestamp", "unique_ports"], ascending=[False, False])
-            st.dataframe(details_df, width="stretch")
+            details_df = details_df.sort_values(by=["timestamp", "unique_ports"], ascending=[False, False]).reset_index(drop=True)
+            details_view = details_df.copy()
+            if "ports_sample" in details_view.columns:
+                details_view["ports_sample"] = (
+                    details_view["ports_sample"]
+                    .astype(str)
+                    .apply(lambda x: x[:120] + ("..." if len(x) > 120 else ""))
+                )
+            details_view["evidence_summary"] = details_view.get("evidence", "").apply(summarize_evidence)
+
+            show_cols = [
+                c for c in [
+                    "timestamp", "rule_name", "severity", "src_ip", "dst_ip",
+                    "unique_ports", "ports_sample", "evidence_summary"
+                ] if c in details_view.columns
+            ]
+            st.dataframe(details_view[show_cols], width="stretch")
+
+            if "evidence" in details_df.columns and not details_df.empty:
+                with st.expander("查看单条告警完整证据"):
+                    idx = st.number_input(
+                        "明细索引",
+                        min_value=0,
+                        max_value=max(0, len(details_df) - 1),
+                        value=0,
+                        step=1,
+                        key="rule_evidence_idx",
+                    )
+                    row = details_df.iloc[int(idx)]
+                    st.json(
+                        {
+                            "timestamp": str(row.get("timestamp")),
+                            "rule_name": row.get("rule_name"),
+                            "severity": row.get("severity"),
+                            "src_ip": row.get("src_ip"),
+                            "dst_ip": row.get("dst_ip"),
+                            "ports_sample": row.get("ports_sample"),
+                            "evidence": row.get("evidence"),
+                        }
+                    )
 
     # Tab 7: 事件中心
     with tab7:
@@ -2498,6 +2714,8 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
 
             st.subheader("事件时间线")
             timeline_df = incident_df.sort_values("start_time", ascending=False).copy()
+            if "stage" not in timeline_df.columns:
+                timeline_df["stage"] = "综合异常"
             st.dataframe(timeline_df, width="stretch")
 
             st.subheader("按源IP聚合")
@@ -2512,18 +2730,62 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             )
             st.dataframe(by_src, width="stretch")
 
+            st.subheader("事件趋势")
+            trend_df = incident_df.copy()
+            trend_df["start_time_dt"] = pd.to_datetime(trend_df["start_time"], errors="coerce")
+            trend_df = trend_df.dropna(subset=["start_time_dt"])
+            if not trend_df.empty:
+                trend_df["minute"] = trend_df["start_time_dt"].dt.floor("min")
+                trend_agg = (
+                    trend_df.groupby("minute", as_index=False)
+                    .agg(incident_count=("incident_id", "count"), alert_count=("alert_count", "sum"))
+                )
+                trend_plot_df = trend_agg.melt(
+                    id_vars=["minute"],
+                    value_vars=["incident_count", "alert_count"],
+                    var_name="metric",
+                    value_name="count",
+                )
+                trend_chart = alt.Chart(trend_plot_df).mark_line(point=True).encode(
+                    x=alt.X("minute:T", title="时间"),
+                    y=alt.Y("count:Q", title="数量"),
+                    color=alt.Color("metric:N", title="指标"),
+                    tooltip=["minute:T", "metric:N", "count:Q"],
+                ).properties(width=700, height=280, title="事件与告警趋势")
+                st.altair_chart(trend_chart, width="stretch")
+
+            st.subheader("风险分分布")
+            risk_chart = alt.Chart(incident_df).mark_bar().encode(
+                x=alt.X("risk_score:Q", bin=alt.Bin(maxbins=20), title="风险分"),
+                y=alt.Y("count()", title="事件数"),
+                color=alt.Color("max_severity:N", title="最高严重级别"),
+            ).properties(width=700, height=260, title="事件风险分分布")
+            st.altair_chart(risk_chart, width="stretch")
+
     # Tab 8: ARP 专题
     with tab8:
         st.header("ARP 攻击检测专题")
         alerts_df = st.session_state.get('rule_alerts_df')
+        pcap_df_for_arp = st.session_state.get("pcap_df")
         if alerts_df is None:
             st.info("暂无规则检测结果，请先在侧栏点击“执行规则检测”。")
         else:
-            arp_rules = ["ARP_FLOOD", "ARP_SCAN", "ARP_SPOOF"]
+            arp_rules = ["ARP_FLOOD", "ARP_SCAN", "ARP_SPOOF", "ARP_MITM_SUSPECT", "ARP_ABUSE"]
             arp_alerts = alerts_df[alerts_df["rule_name"].isin(arp_rules)].copy()
 
             if arp_alerts.empty:
                 st.info("当前结果中未检测到 ARP 相关告警。可尝试上传包含 ARP 流量的 PCAP。")
+                if isinstance(pcap_df_for_arp, pd.DataFrame) and not pcap_df_for_arp.empty and "protocol" in pcap_df_for_arp.columns:
+                    arp_packets = pcap_df_for_arp[pcap_df_for_arp["protocol"].astype(str).str.upper() == "ARP"].copy()
+                    st.caption(
+                        f"ARP 报文观测：包级共 {len(arp_packets)} 条。"
+                        "若未触发告警，通常是当前阈值偏高或行为未达到规则触发条件。"
+                    )
+                    if not arp_packets.empty and "src_ip" in arp_packets.columns:
+                        top_arp_src = (
+                            arp_packets["src_ip"].astype(str).value_counts().head(5).rename_axis("src_ip").reset_index(name="arp_packet_count")
+                        )
+                        st.dataframe(top_arp_src, width="stretch")
             else:
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -2582,6 +2844,23 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             if manifest_rows:
                 manifest_df = pd.DataFrame(manifest_rows).sort_values("timestamp", ascending=False)
                 st.dataframe(manifest_df, width="stretch")
+                # Health check: referenced files existence in recent snapshots.
+                total_refs = 0
+                missing_refs = 0
+                for row in manifest_rows:
+                    paths = row.get("paths", {}) if isinstance(row, dict) else {}
+                    if isinstance(paths, dict):
+                        for _, p in paths.items():
+                            total_refs += 1
+                            if not os.path.exists(p):
+                                missing_refs += 1
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("近期引用日志文件数", int(total_refs))
+                with c2:
+                    st.metric("缺失引用文件数", int(missing_refs))
+                if missing_refs > 0:
+                    st.warning("发现清单中存在缺失日志文件，请检查日志目录是否被清理或移动。")
         else:
             st.info("尚未生成日志快照。请先处理数据/执行规则检测/执行响应动作。")
 
@@ -2590,10 +2869,19 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
         if not log_files:
             st.caption("未找到日志文件。")
         else:
-            selected_file = st.selectbox("选择日志文件", log_files, index=0)
+            log_type_filter = st.selectbox("按日志类型筛选", ["全部", "packet", "flow", "alert", "incident", "action", "manifest"], index=0)
+            filtered_files = log_files
+            if log_type_filter != "全部":
+                filtered_files = [p for p in log_files if f"{os.sep}{log_type_filter}_" in p or p.endswith("manifest.jsonl")]
+            if not filtered_files:
+                st.caption("当前筛选条件下无日志文件。")
+                filtered_files = log_files
+            selected_file = st.selectbox("选择日志文件", filtered_files, index=0)
             if selected_file and os.path.exists(selected_file):
                 with open(selected_file, "rb") as f:
                     content = f.read()
+                file_size_kb = len(content) / 1024.0
+                st.caption(f"文件大小：{file_size_kb:.1f} KB")
                 st.download_button(
                     "下载选中文件",
                     data=content,
@@ -2619,6 +2907,7 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             incident_df=st.session_state.get("incident_df"),
             action_df=st.session_state.get("response_actions_df"),
             llm_assessment=st.session_state.get("llm_assessment", ""),
+            agent_report_markdown=st.session_state.get("agent_report_markdown", ""),
         )
         md_filename = build_report_filename("sentinel_report", ext="md")
         pdf_bytes, pdf_error = markdown_to_pdf_bytes(report_markdown)
@@ -2675,6 +2964,85 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
 
         if st.session_state.get("llm_assessment"):
             st.text_area("研判输出", st.session_state["llm_assessment"], height=240)
+
+    # Tab 11: AI Agent
+    with tab11:
+        st.header("AI 智能研判 Agent")
+        st.caption("融合抓包、规则、事件与异常分数，生成综合研判报告。默认仅上传摘要证据，不上传全量原始报文。")
+
+        anomalies_for_agent = None
+        if "is_alert" in df.columns:
+            anomalies_for_agent = df[df["is_alert"] == 1].copy()
+        elif "score_ensemble_norm" in df.columns:
+            anomalies_for_agent = df.sort_values("score_ensemble_norm", ascending=False).head(100).copy()
+        elif "score_iso_norm" in df.columns:
+            anomalies_for_agent = df.sort_values("score_iso_norm", ascending=False).head(100).copy()
+        else:
+            anomalies_for_agent = df.head(100).copy()
+
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            st.metric("候选异常流量数", int(len(anomalies_for_agent)))
+        with col_b:
+            _alerts_for_metric = st.session_state.get("rule_alerts_df")
+            st.metric("规则告警数", int(len(_alerts_for_metric)) if isinstance(_alerts_for_metric, pd.DataFrame) else 0)
+
+        if st.button("运行 AI Agent 研判", width="stretch", key="agent_run_btn"):
+            result = run_agent_assessment(
+                analysis_df=df,
+                pcap_df=st.session_state.get("pcap_df"),
+                rule_alerts_df=st.session_state.get("rule_alerts_df"),
+                incident_df=st.session_state.get("incident_df"),
+                action_df=st.session_state.get("response_actions_df"),
+                anomalies_df=anomalies_for_agent,
+                provider={
+                    "自动": "auto",
+                    "DeepSeek": "deepseek",
+                    "OpenAI": "openai",
+                }.get(llm_provider_display, "auto"),
+                model=(llm_model_name.strip() if llm_model_name else "auto"),
+                api_key=(llm_api_key_input.strip() if llm_api_key_input else None),
+                base_url=(llm_base_url_input.strip() if llm_base_url_input else None),
+            )
+            st.session_state["agent_context"] = result.get("context", {})
+            st.session_state["llm_assessment"] = result.get("llm_assessment", "")
+            st.session_state["agent_report_markdown"] = result.get("report_markdown", "")
+            st.success("AI Agent 研判完成。")
+
+        agent_ctx = st.session_state.get("agent_context", {})
+        if agent_ctx:
+            st.subheader("Agent 结构化上下文")
+            summary = agent_ctx.get("summary", {})
+            s1, s2, s3, s4, s5, s6 = st.columns(6)
+            s1.metric("报文", int(summary.get("packet_count", 0)))
+            s2.metric("流量", int(summary.get("flow_count", 0)))
+            s3.metric("告警", int(summary.get("alert_count", 0)))
+            s4.metric("事件", int(summary.get("incident_count", 0)))
+            s5.metric("异常", int(summary.get("anomaly_count", 0)))
+            s6.metric("响应动作", int(summary.get("action_count", 0)))
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**规则命中 Top**")
+                top_rules_df = pd.DataFrame(agent_ctx.get("top_rules", []))
+                if not top_rules_df.empty:
+                    st.dataframe(top_rules_df, width="stretch")
+            with c2:
+                st.markdown("**事件 Top**")
+                top_inc_df = pd.DataFrame(agent_ctx.get("top_incidents", []))
+                if not top_inc_df.empty:
+                    st.dataframe(top_inc_df, width="stretch")
+
+        if st.session_state.get("agent_report_markdown"):
+            st.subheader("Agent 综合报告")
+            st.download_button(
+                "下载 Agent 报告（Markdown）",
+                data=st.session_state["agent_report_markdown"],
+                file_name=build_report_filename("sentinel_agent_report", ext="md"),
+                mime="text/markdown",
+                width="stretch",
+            )
+            st.code(st.session_state["agent_report_markdown"][:6000], language="markdown")
 
 # Footer (fixed bottom)
 st.markdown(

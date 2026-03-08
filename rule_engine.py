@@ -27,6 +27,11 @@ ALERT_COLUMNS = [
 ]
 
 
+def _is_ephemeral_port(port: int) -> bool:
+    """Return True if port is likely an ephemeral/client-side port."""
+    return int(port) >= 49152
+
+
 def _severity_from_unique_ports(unique_ports: int, threshold: int) -> str:
     """Map unique port count to alert severity."""
     if unique_ports >= threshold * 3:
@@ -80,6 +85,30 @@ def detect_port_scan(
     if df.empty:
         return pd.DataFrame(columns=ALERT_COLUMNS)
     df["dst_port"] = df["dst_port"].astype(int)
+    # Port-scan rule focuses on TCP/UDP probe-like flows.
+    if "protocol" in df.columns:
+        df = df[df["protocol"].astype(str).str.upper().isin(["TCP", "UDP"])].copy()
+    if df.empty:
+        return pd.DataFrame(columns=ALERT_COLUMNS)
+
+    # Drop invalid destination ports.
+    df = df[(df["dst_port"] > 0) & (df["dst_port"] <= 65535)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=ALERT_COLUMNS)
+
+    # Reduce common reverse-direction false positives:
+    # server-response style flow often appears as src_port well-known, dst_port ephemeral.
+    if "src_port" in df.columns:
+        df["src_port_num"] = pd.to_numeric(df["src_port"], errors="coerce")
+        server_response_like = (
+            df["src_port_num"].notna()
+            & (df["src_port_num"] <= 1024)
+            & df["dst_port"].map(_is_ephemeral_port)
+        )
+        df = df[~server_response_like].copy()
+    if df.empty:
+        return pd.DataFrame(columns=ALERT_COLUMNS)
+
     df["dst_ip"] = df["dst_ip"].astype(str) if "dst_ip" in df.columns else "MULTI"
 
     window = f"{int(window_s)}s"

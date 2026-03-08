@@ -25,7 +25,16 @@ def test_build_markdown_report_contains_incident_and_action_sections():
         ]
     )
     incident_df = pd.DataFrame(
-        [{"incident_id": "INC-00001", "src_ip": "10.0.0.1", "risk_score": 72, "max_severity": "high", "alert_count": 3, "event_chain": "PORT_SCAN -> BRUTE_FORCE"}]
+        [
+            {
+                "incident_id": "INC-00001",
+                "src_ip": "10.0.0.1",
+                "risk_score": 72,
+                "max_severity": "high",
+                "alert_count": 3,
+                "event_chain": "PORT_SCAN -> BRUTE_FORCE",
+            }
+        ]
     )
     action_df = pd.DataFrame(
         [{"timestamp": "2026-03-03T12:01:00", "action_type": "ALERT_LOG", "status": "success", "target": "data/logs", "detail": "ok"}]
