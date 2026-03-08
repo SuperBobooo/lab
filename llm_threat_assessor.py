@@ -33,10 +33,10 @@ def _local_fallback_summary(
         f"- 规则告警总数：{alert_count}",
         f"- 异常流量数量：{anom_count}",
         f"- 规则Top：{rule_stats if rule_stats else '无'}",
-        "- 建议优先处置高危源IP，并结合ARP/DNS异常进行主机侧排查。",
+        "- 建议优先处置高风险源IP，并结合ARP/DNS异常进行主机侧排查。",
     ]
     if reason:
-        lines.append(f"- 外部LLM失败原因：{reason}")
+        lines.append(f"- 外部LLM未使用原因：{reason}")
     return "\n".join(lines)
 
 
@@ -87,7 +87,7 @@ def generate_threat_assessment(
     chosen_provider, chosen_key = _resolve_provider_and_key(provider, api_key)
 
     if not chosen_key:
-        return _local_fallback_summary(alerts_df, anomalies_df, reason="未配置可用API Key")
+        return _local_fallback_summary(alerts_df, anomalies_df, reason="未配置可用 API Key")
 
     alert_preview = ""
     if alerts_df is not None and not alerts_df.empty:
@@ -100,8 +100,11 @@ def generate_threat_assessment(
         anom_preview = anomalies_df[cols].head(20).to_json(orient="records", force_ascii=False)
 
     prompt = (
-        "你是网络安全分析师。请根据以下告警与异常样本，输出简明威胁研判：\n"
-        "1) 关键风险摘要\n2) 可能攻击链\n3) 处置优先级与建议\n"
+        "你是网络安全分析师。请根据以下告警与异常样本，输出中文研判结论，要求：\n"
+        "1) 关键风险摘要\n"
+        "2) 可能攻击链（阶段）\n"
+        "3) 处置优先级与建议\n"
+        "4) 误报风险与复核建议\n"
         f"告警样本: {alert_preview}\n"
         f"异常样本: {anom_preview}\n"
     )
@@ -111,7 +114,7 @@ def generate_threat_assessment(
     payload = {
         "model": resolved_model,
         "messages": [
-            {"role": "system", "content": "你是严谨的SOC分析师，请输出中文。"},
+            {"role": "system", "content": "你是严谨的SOC分析师，请用中文输出。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
