@@ -1,15 +1,24 @@
 """
-G4 mixed traffic sender for SentinelAI validation.
+G4 mixed traffic sender (final demo edition) for SentinelAI.
 
-Run this script on another host in the same test network, while SentinelAI host
-is doing live capture. This script sends:
-1) Baseline normal traffic
-2) Classic attack-like traffic patterns
-3) Variant / stealth traffic patterns
+Purpose:
+- Generate comprehensive, bounded lab traffic for end-to-end validation:
+  baseline + classic + variant patterns.
+- Designed for authorized cyber-security training labs only.
 
-Important:
-- Use ONLY in authorized lab environments.
-- This script generates traffic patterns for detection validation, not exploitation.
+Coverage:
+1) Baseline normal traffic: TCP(80/443), DNS, UDP, low-rate steady flows.
+2) Port scan: TCP + UDP fast scan, slow scan, segmented scan.
+3) Brute-force pattern: repeated short TCP connects to single target port.
+4) DoS-like pattern: bounded burst to fixed service ports.
+5) Exfil-like pattern: burst large UDP + low-slow chunk transfer.
+6) DNS anomaly: high-frequency random subdomain queries.
+7) ARP optional (same L2): scan/flood/conflict-like samples.
+8) Variant additions: jittered beacon, protocol-mixed low-rate probes.
+
+Notes:
+- This script does not exploit vulnerabilities.
+- Keep traffic bounded with --rate-factor and internal hard caps.
 """
 
 from __future__ import annotations
@@ -22,10 +31,9 @@ import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable, Optional
 
 try:
-    # Optional: only for ARP lab scenarios in same L2.
     from scapy.all import ARP, Ether, sendp  # type: ignore
 
     SCAPY_AVAILABLE = True
@@ -33,52 +41,71 @@ except Exception:
     SCAPY_AVAILABLE = False
 
 
+TCP_SCAN_PORTS = [
+    21, 22, 23, 25, 53, 80, 110, 123, 135, 139, 143, 443, 445, 993, 995,
+    1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9001,
+]
+UDP_SCAN_PORTS = [53, 67, 68, 69, 123, 137, 161, 500, 514, 1900, 5353, 9999]
+
+
 @dataclass
 class TrafficContext:
     target_ip: str
+    src_ips: list[str]
     http_port: int
+    tls_port: int
     dns_port: int
     brute_force_port: int
     exfil_port: int
-    phase_sleep_s: float
+    dos_ports: list[int]
+    phase_tick_s: float
     jitter_s: float
-    log_path: Path
     dns_domain: str
     rate_factor: float
+    log_path: Path
     arp_enable: bool
-    arp_iface: str | None
-    arp_gateway_ip: str | None
-    arp_victim_ip: str | None
+    arp_iface: Optional[str]
+    arp_gateway_ip: Optional[str]
+    arp_victim_ip: Optional[str]
+    arp_scan_cidr_prefix: Optional[str]
 
 
-def _now_ts() -> float:
+@dataclass
+class Phase:
+    name: str
+    duration_s: int
+
+
+def _now() -> float:
     return time.time()
 
 
-def _jitter(base: float, jitter: float) -> float:
-    if jitter <= 0:
-        return max(0.0, base)
-    return max(0.0, base + random.uniform(-jitter, jitter))
+def _sleep_jitter(base_s: float, jitter_s: float) -> None:
+    wait_s = base_s + random.uniform(-jitter_s, jitter_s) if jitter_s > 0 else base_s
+    time.sleep(max(0.0, wait_s))
 
 
-def _log(log_path: Path, event: str, detail: dict) -> None:
-    record = {
-        "timestamp": _now_ts(),
-        "event": event,
-        "detail": detail,
-    }
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+def _log(path: Path, event: str, detail: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"timestamp": _now(), "event": event, "detail": detail}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _safe_connect_tcp(target_ip: str, target_port: int, timeout_s: float = 0.3) -> bool:
+def _pick_src_ip(ctx: TrafficContext) -> Optional[str]:
+    if not ctx.src_ips:
+        return None
+    return random.choice(ctx.src_ips)
+
+
+def _tcp_connect(target_ip: str, target_port: int, timeout_s: float = 0.25, src_ip: Optional[str] = None) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout_s)
     try:
-        sock.connect((target_ip, target_port))
-        payload = b"HELLO_SENTINELAI\r\n"
-        sock.sendall(payload)
+        if src_ip:
+            sock.bind((src_ip, 0))
+        sock.connect((target_ip, int(target_port)))
+        sock.sendall(b"LAB_TRAFFIC\r\n")
         return True
     except Exception:
         return False
@@ -86,11 +113,13 @@ def _safe_connect_tcp(target_ip: str, target_port: int, timeout_s: float = 0.3) 
         sock.close()
 
 
-def _safe_send_udp(target_ip: str, target_port: int, payload_size: int = 64) -> bool:
+def _udp_send(target_ip: str, target_port: int, size: int, src_ip: Optional[str] = None) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        payload = b"A" * max(1, payload_size)
-        sock.sendto(payload, (target_ip, target_port))
+        if src_ip:
+            sock.bind((src_ip, 0))
+        payload = b"U" * max(1, int(size))
+        sock.sendto(payload, (target_ip, int(target_port)))
         return True
     except Exception:
         return False
@@ -98,22 +127,22 @@ def _safe_send_udp(target_ip: str, target_port: int, payload_size: int = 64) -> 
         sock.close()
 
 
-def _build_dns_query(domain: str, txid: int | None = None) -> bytes:
+def _build_dns_query(domain: str, txid: Optional[int] = None) -> bytes:
     if txid is None:
         txid = random.randint(0, 65535)
-    # Standard query, recursion desired.
     header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
-    qname = b"".join(len(x).to_bytes(1, "big") + x.encode("ascii", errors="ignore") for x in domain.split(".")) + b"\x00"
-    qtype_qclass = struct.pack("!HH", 1, 1)  # A / IN
-    return header + qname + qtype_qclass
+    labels = domain.split(".")
+    qname = b"".join(len(x).to_bytes(1, "big") + x.encode("ascii", errors="ignore") for x in labels) + b"\x00"
+    return header + qname + struct.pack("!HH", 1, 1)
 
 
-def _send_dns_query(dns_server_ip: str, dns_port: int, domain: str) -> bool:
+def _dns_query(target_ip: str, dns_port: int, domain: str, src_ip: Optional[str] = None) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.3)
     try:
-        pkt = _build_dns_query(domain)
-        sock.sendto(pkt, (dns_server_ip, dns_port))
+        if src_ip:
+            sock.bind((src_ip, 0))
+        sock.sendto(_build_dns_query(domain), (target_ip, int(dns_port)))
         return True
     except Exception:
         return False
@@ -121,12 +150,19 @@ def _send_dns_query(dns_server_ip: str, dns_port: int, domain: str) -> bool:
         sock.close()
 
 
-def _http_get(target_ip: str, target_port: int, path: str = "/") -> bool:
+def _http_get(target_ip: str, port: int, path: str = "/", src_ip: Optional[str] = None) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
+    sock.settimeout(0.4)
     try:
-        sock.connect((target_ip, target_port))
-        req = f"GET {path} HTTP/1.1\r\nHost: {target_ip}\r\nUser-Agent: SentinelLab/1.0\r\nConnection: close\r\n\r\n".encode()
+        if src_ip:
+            sock.bind((src_ip, 0))
+        sock.connect((target_ip, int(port)))
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {target_ip}\r\n"
+            "User-Agent: SentinelLab-G4/2.0\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
         sock.sendall(req)
         return True
     except Exception:
@@ -135,209 +171,286 @@ def _http_get(target_ip: str, target_port: int, path: str = "/") -> bool:
         sock.close()
 
 
-def _random_subdomain(base_domain: str, prefix_len: int = 10) -> str:
-    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-    prefix = "".join(random.choice(alphabet) for _ in range(prefix_len))
-    return f"{prefix}.{base_domain}"
+def _random_subdomain(base_domain: str, min_len: int = 8, max_len: int = 20) -> str:
+    chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    n = random.randint(min_len, max_len)
+    sub = "".join(random.choice(chars) for _ in range(n))
+    return f"{sub}.{base_domain}"
 
 
-def _phase_baseline(ctx: TrafficContext, elapsed_s: int) -> None:
-    # Normal business-like traffic.
-    _http_get(ctx.target_ip, ctx.http_port, "/")
-    _safe_connect_tcp(ctx.target_ip, 443, timeout_s=0.2)
-    _send_dns_query(ctx.target_ip, ctx.dns_port, ctx.dns_domain)
-    _safe_send_udp(ctx.target_ip, 12345, payload_size=64)
-    _log(ctx.log_path, "baseline_tick", {"elapsed_s": elapsed_s})
+def _bounded(v: int, low: int, high: int) -> int:
+    return max(low, min(high, v))
 
 
-def _phase_classic(ctx: TrafficContext, elapsed_s: int) -> None:
-    # 1) Port scan pattern.
-    scan_ports = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 3306, 3389, 5432, 6379, 8080]
-    random.shuffle(scan_ports)
-    # Rate is controlled by selecting subset each tick.
-    pick_n = max(3, min(len(scan_ports), int(6 * ctx.rate_factor)))
-    for p in scan_ports[:pick_n]:
-        _safe_connect_tcp(ctx.target_ip, p, timeout_s=0.15)
+def _phase_baseline(ctx: TrafficContext, elapsed: int) -> None:
+    src = _pick_src_ip(ctx)
+    _http_get(ctx.target_ip, ctx.http_port, "/", src_ip=src)
+    _tcp_connect(ctx.target_ip, ctx.tls_port, src_ip=src)
+    _dns_query(ctx.target_ip, ctx.dns_port, ctx.dns_domain, src_ip=src)
+    _udp_send(ctx.target_ip, 12345, size=64, src_ip=src)
+    _log(ctx.log_path, "baseline", {"elapsed_s": elapsed})
 
-    # 2) Brute-force-like repeated attempts.
-    bf_attempts = max(4, int(8 * ctx.rate_factor))
-    for _ in range(bf_attempts):
-        _safe_connect_tcp(ctx.target_ip, ctx.brute_force_port, timeout_s=0.15)
 
-    # 3) DoS-like burst (bounded).
-    burst_n = max(6, int(15 * ctx.rate_factor))
-    for _ in range(burst_n):
-        _safe_send_udp(ctx.target_ip, ctx.http_port, payload_size=128)
+def _phase_classic(ctx: TrafficContext, elapsed: int) -> None:
+    # A) Fast TCP scan
+    tcp_n = _bounded(int(10 * ctx.rate_factor), 4, 18)
+    for p in random.sample(TCP_SCAN_PORTS, k=tcp_n):
+        _tcp_connect(ctx.target_ip, p, timeout_s=0.12, src_ip=_pick_src_ip(ctx))
 
-    # 4) Data exfiltration-like large payload bursts.
-    exfil_n = max(2, int(4 * ctx.rate_factor))
-    for _ in range(exfil_n):
-        _safe_send_udp(ctx.target_ip, ctx.exfil_port, payload_size=1200)
+    # B) Fast UDP scan
+    udp_n = _bounded(int(6 * ctx.rate_factor), 3, 10)
+    for p in random.sample(UDP_SCAN_PORTS, k=udp_n):
+        _udp_send(ctx.target_ip, p, size=56, src_ip=_pick_src_ip(ctx))
+
+    # C) Brute-force style
+    bf_n = _bounded(int(14 * ctx.rate_factor), 6, 30)
+    for _ in range(bf_n):
+        _tcp_connect(ctx.target_ip, ctx.brute_force_port, timeout_s=0.10, src_ip=_pick_src_ip(ctx))
+
+    # D) DoS-like bounded burst
+    dos_n = _bounded(int(22 * ctx.rate_factor), 8, 45)
+    for _ in range(dos_n):
+        port = random.choice(ctx.dos_ports)
+        _udp_send(ctx.target_ip, port, size=160, src_ip=_pick_src_ip(ctx))
+
+    # E) Exfil burst
+    exfil_burst_n = _bounded(int(8 * ctx.rate_factor), 3, 14)
+    for _ in range(exfil_burst_n):
+        _udp_send(ctx.target_ip, ctx.exfil_port, size=1300, src_ip=_pick_src_ip(ctx))
+
+    # F) DNS anomaly high rate
+    dns_n = _bounded(int(7 * ctx.rate_factor), 3, 14)
+    for _ in range(dns_n):
+        _dns_query(ctx.target_ip, ctx.dns_port, _random_subdomain(ctx.dns_domain, 10, 18), src_ip=_pick_src_ip(ctx))
 
     _log(
         ctx.log_path,
-        "classic_tick",
-        {"elapsed_s": elapsed_s, "scan_ports": pick_n, "bf_attempts": bf_attempts, "dos_burst": burst_n, "exfil_burst": exfil_n},
+        "classic",
+        {
+            "elapsed_s": elapsed,
+            "tcp_scan_n": tcp_n,
+            "udp_scan_n": udp_n,
+            "bf_n": bf_n,
+            "dos_n": dos_n,
+            "exfil_burst_n": exfil_burst_n,
+            "dns_n": dns_n,
+        },
     )
 
 
-def _phase_variant(ctx: TrafficContext, elapsed_s: int) -> None:
-    # Variant 1: slow scan with jitter (harder for simple threshold).
-    slow_scan_ports = [22, 25, 53, 80, 110, 143, 443, 3389, 5900, 8080]
-    p = random.choice(slow_scan_ports)
-    _safe_connect_tcp(ctx.target_ip, p, timeout_s=0.2)
+def _phase_variant(ctx: TrafficContext, elapsed: int) -> None:
+    # A) Slow scan (1-2s style when combined with phase tick+jitter)
+    p = random.choice(TCP_SCAN_PORTS)
+    _tcp_connect(ctx.target_ip, p, timeout_s=0.2, src_ip=_pick_src_ip(ctx))
 
-    # Variant 2: low-and-slow exfil chunks.
-    chunk_size = random.choice([200, 280, 360, 420])
-    _safe_send_udp(ctx.target_ip, ctx.exfil_port, payload_size=chunk_size)
+    # B) Segmented scan (small batch now, next batch in later ticks)
+    seg_n = _bounded(int(3 * ctx.rate_factor), 1, 5)
+    for p in random.sample(TCP_SCAN_PORTS, k=seg_n):
+        _tcp_connect(ctx.target_ip, p, timeout_s=0.16, src_ip=_pick_src_ip(ctx))
 
-    # Variant 3: DNS tunnel-like random subdomains.
-    for _ in range(max(1, int(2 * ctx.rate_factor))):
-        domain = _random_subdomain(ctx.dns_domain, prefix_len=random.choice([8, 12, 16]))
-        _send_dns_query(ctx.target_ip, ctx.dns_port, domain)
+    # C) Low-slow exfil
+    chunk = random.choice([180, 220, 260, 320, 420])
+    _udp_send(ctx.target_ip, ctx.exfil_port, size=chunk, src_ip=_pick_src_ip(ctx))
 
-    # Variant 4: jittered beacon pattern.
-    _safe_send_udp(ctx.target_ip, 18002, payload_size=random.choice([48, 64, 80]))
+    # D) DNS variant jitter + random labels
+    dns_n = _bounded(int(2 * ctx.rate_factor), 1, 4)
+    for _ in range(dns_n):
+        _dns_query(ctx.target_ip, ctx.dns_port, _random_subdomain(ctx.dns_domain, 12, 24), src_ip=_pick_src_ip(ctx))
 
-    _log(ctx.log_path, "variant_tick", {"elapsed_s": elapsed_s, "slow_scan_port": p, "exfil_chunk": chunk_size})
+    # E) Protocol mixed probing (avoid single-rule dominance)
+    _udp_send(ctx.target_ip, random.choice([53, 80, 443, 8080, 18002]), size=72, src_ip=_pick_src_ip(ctx))
+    _tcp_connect(ctx.target_ip, random.choice([80, 443, 8080, 9001]), timeout_s=0.18, src_ip=_pick_src_ip(ctx))
+
+    # F) Jitter beacon
+    _udp_send(ctx.target_ip, 18002, size=random.choice([48, 64, 80]), src_ip=_pick_src_ip(ctx))
+
+    _log(
+        ctx.log_path,
+        "variant",
+        {"elapsed_s": elapsed, "slow_port": p, "seg_n": seg_n, "exfil_chunk": chunk, "dns_n": dns_n},
+    )
 
 
-def _phase_arp_optional(ctx: TrafficContext, elapsed_s: int) -> None:
+def _arp_optional(ctx: TrafficContext, elapsed: int) -> None:
     if not ctx.arp_enable:
         return
     if not SCAPY_AVAILABLE:
-        _log(ctx.log_path, "arp_skip", {"reason": "scapy_not_available"})
+        _log(ctx.log_path, "arp_skip", {"elapsed_s": elapsed, "reason": "scapy_missing"})
         return
-    if not ctx.arp_iface or not ctx.arp_gateway_ip or not ctx.arp_victim_ip:
-        _log(ctx.log_path, "arp_skip", {"reason": "missing_iface_or_ips"})
+    if not ctx.arp_iface:
+        _log(ctx.log_path, "arp_skip", {"elapsed_s": elapsed, "reason": "arp_iface_missing"})
         return
+
     try:
-        # Controlled ARP samples: scan-style requests + spoof-like gratuitous replies.
-        req = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, pdst=ctx.arp_victim_ip)
-        sendp(req, iface=ctx.arp_iface, verbose=False, count=max(1, int(2 * ctx.rate_factor)))
+        # 1) ARP scan-like requests (multi target in /24 prefix if provided)
+        targets = []
+        if ctx.arp_scan_cidr_prefix:
+            for i in random.sample(range(2, 254), k=6):
+                targets.append(f"{ctx.arp_scan_cidr_prefix}.{i}")
+        elif ctx.arp_victim_ip:
+            targets = [ctx.arp_victim_ip]
+        else:
+            targets = []
 
-        spoof = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(
-            op=2,
-            psrc=ctx.arp_gateway_ip,
-            pdst=ctx.arp_victim_ip,
-            hwdst="ff:ff:ff:ff:ff:ff",
-        )
-        sendp(spoof, iface=ctx.arp_iface, verbose=False, count=max(1, int(2 * ctx.rate_factor)))
-        _log(ctx.log_path, "arp_tick", {"elapsed_s": elapsed_s, "iface": ctx.arp_iface})
+        for ip in targets:
+            req = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, pdst=ip)
+            sendp(req, iface=ctx.arp_iface, verbose=False, count=1)
+
+        # 2) ARP flood-like small burst (bounded)
+        flood_n = _bounded(int(4 * ctx.rate_factor), 2, 8)
+        if targets:
+            for _ in range(flood_n):
+                ip = random.choice(targets)
+                req = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, pdst=ip)
+                sendp(req, iface=ctx.arp_iface, verbose=False, count=1)
+
+        # 3) ARP conflict/spoof-like reply sample (single bounded message)
+        if ctx.arp_gateway_ip and ctx.arp_victim_ip:
+            spoof = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(
+                op=2,
+                psrc=ctx.arp_gateway_ip,
+                pdst=ctx.arp_victim_ip,
+                hwdst="ff:ff:ff:ff:ff:ff",
+            )
+            sendp(spoof, iface=ctx.arp_iface, verbose=False, count=1)
+
+        _log(ctx.log_path, "arp", {"elapsed_s": elapsed, "target_count": len(targets)})
     except Exception as exc:
-        _log(ctx.log_path, "arp_error", {"error": str(exc)})
-
-
-@dataclass
-class Phase:
-    name: str
-    duration_s: int
-    action: Callable[[TrafficContext, int], None]
+        _log(ctx.log_path, "arp_error", {"elapsed_s": elapsed, "error": str(exc)})
 
 
 def _run_phase(ctx: TrafficContext, phase: Phase) -> None:
     print(f"[+] Phase start: {phase.name} ({phase.duration_s}s)")
-    phase_start = time.time()
-    tick = 0
+    t0 = _now()
+    ticks = 0
     while True:
-        elapsed = time.time() - phase_start
+        elapsed = int(_now() - t0)
         if elapsed >= phase.duration_s:
             break
-        phase.action(ctx, int(elapsed))
-        # Optional ARP samples are attached in classic/variant windows.
-        if phase.name in {"classic", "variant"}:
-            _phase_arp_optional(ctx, int(elapsed))
-        tick += 1
-        sleep_s = _jitter(ctx.phase_sleep_s / max(ctx.rate_factor, 0.1), ctx.jitter_s)
-        time.sleep(sleep_s)
-    print(f"[+] Phase done: {phase.name}, ticks={tick}")
+
+        if phase.name == "baseline":
+            _phase_baseline(ctx, elapsed)
+        elif phase.name == "classic":
+            _phase_classic(ctx, elapsed)
+            _arp_optional(ctx, elapsed)
+        elif phase.name == "variant":
+            _phase_variant(ctx, elapsed)
+            _arp_optional(ctx, elapsed)
+
+        ticks += 1
+        _sleep_jitter(ctx.phase_tick_s / max(0.1, ctx.rate_factor), ctx.jitter_s)
+
+    print(f"[+] Phase done: {phase.name}, ticks={ticks}")
 
 
-def build_g4_phases(total_s: int) -> Iterable[Phase]:
-    # Keep 30/40/30 split: baseline / classic / variant.
-    baseline_s = max(10, int(total_s * 0.30))
-    classic_s = max(10, int(total_s * 0.40))
-    variant_s = max(10, total_s - baseline_s - classic_s)
-
+def build_g4_phases(total_s: int) -> list[Phase]:
+    # 25% baseline + 45% classic + 30% variant
+    baseline = max(20, int(total_s * 0.25))
+    classic = max(30, int(total_s * 0.45))
+    variant = max(20, total_s - baseline - classic)
     return [
-        Phase(name="baseline", duration_s=baseline_s, action=_phase_baseline),
-        Phase(name="classic", duration_s=classic_s, action=_phase_classic),
-        Phase(name="variant", duration_s=variant_s, action=_phase_variant),
+        Phase("baseline", baseline),
+        Phase("classic", classic),
+        Phase("variant", variant),
     ]
 
 
+def _parse_src_ips(raw: str) -> list[str]:
+    raw = raw.strip()
+    if not raw:
+        return []
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="G4 mixed traffic sender for SentinelAI lab.")
-    parser.add_argument("--target-ip", required=True, help="SentinelAI host IP (capture target).")
-    parser.add_argument("--duration-s", type=int, default=300, help="Total scenario duration in seconds (default: 300).")
-    parser.add_argument("--http-port", type=int, default=80, help="HTTP target port for normal traffic.")
-    parser.add_argument("--dns-port", type=int, default=53, help="DNS target port.")
-    parser.add_argument("--bruteforce-port", type=int, default=22, help="Port used for brute-force-like attempts.")
-    parser.add_argument("--exfil-port", type=int, default=9001, help="UDP port used for exfil-like traffic.")
-    parser.add_argument("--phase-sleep-s", type=float, default=0.5, help="Base sleep interval per tick.")
-    parser.add_argument("--jitter-s", type=float, default=0.15, help="Random jitter on sleep interval.")
-    parser.add_argument("--dns-domain", default="example.com", help="Base domain used for DNS queries.")
-    parser.add_argument("--rate-factor", type=float, default=1.0, help="Traffic intensity factor (0.5~3.0 recommended).")
-    parser.add_argument("--seed", type=int, default=20260305, help="Random seed.")
-    parser.add_argument("--log-path", default="sender_g4_traffic.jsonl", help="Sender local audit log path.")
+    p = argparse.ArgumentParser(description="Comprehensive G4 sender for SentinelAI final demo.")
+    p.add_argument("--target-ip", required=True, help="SentinelAI host IP.")
+    p.add_argument("--duration-s", type=int, default=300, help="Total scenario duration.")
+    p.add_argument("--rate-factor", type=float, default=1.0, help="Traffic intensity factor (0.5~2.0 recommended).")
+    p.add_argument("--seed", type=int, default=20260308, help="Random seed.")
+    p.add_argument("--phase-tick-s", type=float, default=0.8, help="Base tick interval.")
+    p.add_argument("--jitter-s", type=float, default=0.25, help="Tick jitter.")
+    p.add_argument("--http-port", type=int, default=80)
+    p.add_argument("--tls-port", type=int, default=443)
+    p.add_argument("--dns-port", type=int, default=53)
+    p.add_argument("--bruteforce-port", type=int, default=22)
+    p.add_argument("--exfil-port", type=int, default=9001)
+    p.add_argument("--dos-ports", default="80,443,8080", help="Comma-separated ports for dos-like bursts.")
+    p.add_argument("--dns-domain", default="example.com")
+    p.add_argument("--src-ips", default="", help="Optional comma-separated local source IPs for pseudo-distributed mode.")
+    p.add_argument("--log-path", default="sender_g4_traffic.jsonl")
 
-    # Optional ARP lab options.
-    parser.add_argument("--enable-arp", action="store_true", help="Enable optional ARP sample generation.")
-    parser.add_argument("--arp-iface", default=None, help="Interface name for ARP packets (scapy sendp).")
-    parser.add_argument("--arp-gateway-ip", default=None, help="Gateway IP used in ARP spoof-like sample.")
-    parser.add_argument("--arp-victim-ip", default=None, help="Victim IP used in ARP sample.")
+    # Optional ARP
+    p.add_argument("--enable-arp", action="store_true")
+    p.add_argument("--arp-iface", default=None)
+    p.add_argument("--arp-gateway-ip", default=None)
+    p.add_argument("--arp-victim-ip", default=None)
+    p.add_argument("--arp-scan-cidr-prefix", default=None, help="e.g. 192.168.253 (for /24 style ARP scan targets).")
 
-    parser.add_argument(
+    p.add_argument(
         "--confirm-lab",
         action="store_true",
-        help="Required safety flag. Must be set to run traffic generation in authorized lab.",
+        help="Required safety switch: confirm authorized lab use.",
     )
-    return parser.parse_args()
+    return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-
     if not args.confirm_lab:
-        print("[!] Refuse to run without --confirm-lab.")
-        print("    Use only in authorized lab environments.")
+        print("[!] Refuse to run without --confirm-lab")
         return 2
 
     random.seed(args.seed)
 
+    try:
+        dos_ports = [int(x.strip()) for x in str(args.dos_ports).split(",") if x.strip()]
+    except Exception:
+        print("[!] --dos-ports parse error")
+        return 2
+    if not dos_ports:
+        dos_ports = [80, 443, 8080]
+
     ctx = TrafficContext(
         target_ip=args.target_ip,
-        http_port=args.http_port,
-        dns_port=args.dns_port,
-        brute_force_port=args.bruteforce_port,
-        exfil_port=args.exfil_port,
-        phase_sleep_s=args.phase_sleep_s,
-        jitter_s=args.jitter_s,
-        log_path=Path(args.log_path),
+        src_ips=_parse_src_ips(args.src_ips),
+        http_port=int(args.http_port),
+        tls_port=int(args.tls_port),
+        dns_port=int(args.dns_port),
+        brute_force_port=int(args.bruteforce_port),
+        exfil_port=int(args.exfil_port),
+        dos_ports=dos_ports,
+        phase_tick_s=max(0.2, float(args.phase_tick_s)),
+        jitter_s=max(0.0, float(args.jitter_s)),
         dns_domain=args.dns_domain,
-        rate_factor=max(0.1, float(args.rate_factor)),
+        rate_factor=max(0.2, min(3.0, float(args.rate_factor))),
+        log_path=Path(args.log_path),
         arp_enable=bool(args.enable_arp),
         arp_iface=args.arp_iface,
         arp_gateway_ip=args.arp_gateway_ip,
         arp_victim_ip=args.arp_victim_ip,
+        arp_scan_cidr_prefix=args.arp_scan_cidr_prefix,
     )
 
+    phases = build_g4_phases(int(args.duration_s))
     _log(
         ctx.log_path,
         "run_start",
         {
             "target_ip": ctx.target_ip,
-            "duration_s": args.duration_s,
+            "duration_s": int(args.duration_s),
             "rate_factor": ctx.rate_factor,
+            "phases": [f"{x.name}:{x.duration_s}" for x in phases],
             "arp_enable": ctx.arp_enable,
         },
     )
 
-    print("[+] Start G4 mixed scenario")
-    print(f"    target={ctx.target_ip}, duration={args.duration_s}s, rate_factor={ctx.rate_factor}")
-    print(f"    sender_log={ctx.log_path}")
+    print("[+] G4 final demo sender started")
+    print(f"    target={ctx.target_ip}, duration={int(args.duration_s)}s, rate_factor={ctx.rate_factor}")
+    print(f"    phases={[(x.name, x.duration_s) for x in phases]}")
+    print(f"    log={ctx.log_path}")
 
-    phases = list(build_g4_phases(args.duration_s))
     for phase in phases:
         _run_phase(ctx, phase)
 
