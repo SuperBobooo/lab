@@ -30,9 +30,11 @@ import joblib
 import threading
 import queue
 from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.svm import OneClassSVM
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn import metrics
 
 # Import the data generator
@@ -46,6 +48,7 @@ from attack_lab.mutation_sample_generator import generate_mutation_attack_pcap
 from alert_center import build_incidents
 from llm_threat_assessor import generate_threat_assessment
 from agent_assessor import run_agent_assessment
+from llm_chat_assistant import generate_contextual_chat_reply
 from rule_engine import (
     detect_anomalous_dns,
     detect_arp_anomalies,
@@ -72,7 +75,6 @@ plt.rcParams["axes.unicode_minus"] = False
 warnings.filterwarnings("ignore", message="Glyph .* missing from font", category=UserWarning)
 
 # Create a global queue for real-time flow updates
-flow_queue = queue.Queue(maxsize=100)
 
 # Early session defaults (needed by sidebar controls)
 if 'live_capture_running' not in st.session_state:
@@ -318,46 +320,53 @@ st.markdown("""
 def create_flow_simulator(df, speed_factor, flow_queue, stop_event=None):
     """Create a flow generator that simulates real-time flow data"""
     def simulate_flows():
-        # Get flow data from dataframe
-        flows = df.copy()
-        if flows.empty or 'timestamp' not in flows.columns:
-            return
-        flows = flows.sort_values('timestamp')
+        try:
+            # Get flow data from dataframe
+            flows = df.copy()
+            if flows.empty or 'timestamp' not in flows.columns:
+                return
+            flows = flows.sort_values('timestamp')
 
-        # Keep replay smooth: use inter-arrival time and cap max sleep to avoid long freeze.
-        prev_ts = flows.iloc[0]['timestamp']
-        speed = max(float(speed_factor), 0.1)
-        max_sleep_s = 0.5
+            # Keep replay smooth: use inter-arrival time and cap max sleep to avoid long freeze.
+            prev_ts = flows.iloc[0]['timestamp']
+            speed = max(float(speed_factor), 0.1)
+            max_sleep_s = 0.5
 
-        # Process each flow
-        for _, flow in flows.iterrows():
-            if stop_event is not None and stop_event.is_set():
-                break
-            current_ts = flow.get('timestamp', prev_ts)
-            iat_s = 0.0
-            if pd.notna(current_ts) and pd.notna(prev_ts):
-                try:
-                    iat_s = max(0.0, float((current_ts - prev_ts).total_seconds()))
-                except Exception:
-                    iat_s = 0.0
-
-            sleep_s = min(iat_s / speed, max_sleep_s)
-            if sleep_s > 0:
+            # Process each flow
+            for _, flow in flows.iterrows():
                 if stop_event is not None and stop_event.is_set():
                     break
-                time.sleep(sleep_s)
+                current_ts = flow.get('timestamp', prev_ts)
+                iat_s = 0.0
+                if pd.notna(current_ts) and pd.notna(prev_ts):
+                    try:
+                        iat_s = max(0.0, float((current_ts - prev_ts).total_seconds()))
+                    except Exception:
+                        iat_s = 0.0
 
-            # Add to queue
-            try:
-                flow_queue.put(flow.to_dict(), block=False)
-            except queue.Full:
-                # If queue is full, remove oldest item
+                sleep_s = min(iat_s / speed, max_sleep_s)
+                if sleep_s > 0:
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    time.sleep(sleep_s)
+
+                # Add to queue
                 try:
-                    flow_queue.get(block=False)
                     flow_queue.put(flow.to_dict(), block=False)
-                except queue.Empty:
-                    pass
-            prev_ts = current_ts
+                except queue.Full:
+                    # If queue is full, remove oldest item
+                    try:
+                        flow_queue.get(block=False)
+                        flow_queue.put(flow.to_dict(), block=False)
+                    except queue.Empty:
+                        pass
+                prev_ts = current_ts
+        except Exception as e:
+            # Surface background-thread errors to UI loop.
+            try:
+                flow_queue.put({"__sim_error": str(e)}, block=False)
+            except Exception:
+                pass
 
     return threading.Thread(target=simulate_flows)
 
@@ -496,6 +505,55 @@ def summarize_evidence(evidence_text: object) -> str:
     return "; ".join(parts)
 
 
+def build_agent_chat_context(
+    analysis_df: pd.DataFrame | None,
+    packet_df: pd.DataFrame | None,
+    alerts_df: pd.DataFrame | None,
+    incident_df: pd.DataFrame | None,
+    action_df: pd.DataFrame | None,
+    agent_ctx: dict | None,
+    llm_assessment: str = "",
+) -> dict:
+    """Build compact structured context for agent chat."""
+    ctx = agent_ctx.copy() if isinstance(agent_ctx, dict) else {}
+    summary = ctx.get("summary", {}) if isinstance(ctx.get("summary"), dict) else {}
+    summary = {
+        "packet_count": int(summary.get("packet_count", len(packet_df) if isinstance(packet_df, pd.DataFrame) else 0)),
+        "flow_count": int(summary.get("flow_count", len(analysis_df) if isinstance(analysis_df, pd.DataFrame) else 0)),
+        "alert_count": int(summary.get("alert_count", len(alerts_df) if isinstance(alerts_df, pd.DataFrame) else 0)),
+        "incident_count": int(summary.get("incident_count", len(incident_df) if isinstance(incident_df, pd.DataFrame) else 0)),
+        "action_count": int(summary.get("action_count", len(action_df) if isinstance(action_df, pd.DataFrame) else 0)),
+    }
+    ctx["summary"] = summary
+
+    if "top_rules" not in ctx and isinstance(alerts_df, pd.DataFrame) and not alerts_df.empty and "rule_name" in alerts_df.columns:
+        vc = alerts_df["rule_name"].astype(str).value_counts().head(10)
+        ctx["top_rules"] = [{"value": str(k), "count": int(v)} for k, v in vc.items()]
+
+    if "top_incidents" not in ctx and isinstance(incident_df, pd.DataFrame) and not incident_df.empty:
+        cols = [c for c in ["incident_id", "src_ip", "risk_score", "max_severity", "alert_count", "rules"] if c in incident_df.columns]
+        top_inc = incident_df.sort_values("risk_score", ascending=False).head(10) if "risk_score" in incident_df.columns else incident_df.head(10)
+        ctx["top_incidents"] = top_inc[cols].to_dict(orient="records") if cols else []
+
+    if isinstance(analysis_df, pd.DataFrame) and not analysis_df.empty:
+        score_col = None
+        for c in ["score_ensemble_norm", "score_iso_norm", "score_ocsvm_norm", "score_dbscan_norm"]:
+            if c in analysis_df.columns:
+                score_col = c
+                break
+        if score_col:
+            cols = [c for c in ["timestamp", "src_ip", "dst_ip", "protocol", "dst_port", score_col] if c in analysis_df.columns]
+            top_anom = analysis_df.sort_values(score_col, ascending=False).head(15)
+            ctx["top_anomalies"] = top_anom[cols].to_dict(orient="records")
+            ctx["anomaly_score_column"] = score_col
+
+    llm_text = (llm_assessment or "").strip()
+    if llm_text:
+        ctx["llm_assessment_excerpt"] = llm_text[:2000]
+
+    return ctx
+
+
 def apply_rule_alert_filters(
     alerts_df: pd.DataFrame,
     exclude_src_ips_text: str = "",
@@ -524,6 +582,200 @@ def apply_rule_alert_filters(
             out = out[~out["rule_name"].astype(str).isin(rule_set)].copy()
 
     return out.reset_index(drop=True)
+
+
+def has_binary_ground_truth(df: pd.DataFrame) -> bool:
+    """Check whether dataframe has usable normal/attack labels."""
+    if df is None or df.empty or 'label' not in df.columns:
+        return False
+    labels = df['label'].astype(str).str.lower().dropna()
+    return ('normal' in set(labels)) and ('attack' in set(labels))
+
+
+def find_best_threshold_for_accuracy(y_true: pd.Series, score: pd.Series) -> tuple[float, dict]:
+    """
+    Find threshold that maximizes accuracy.
+    Tie-breaker: higher F1, then higher recall.
+    """
+    y = pd.Series(y_true).astype(int).values
+    s = pd.Series(score).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    candidates = np.unique(np.clip(np.concatenate([np.linspace(0.0, 1.0, 201), s]), 0.0, 1.0))
+
+    best_thr = 0.8
+    best = {"accuracy": -1.0, "f1": -1.0, "recall": -1.0, "precision": 0.0}
+
+    for thr in candidates:
+        pred = (s >= thr).astype(int)
+        acc = metrics.accuracy_score(y, pred)
+        f1 = metrics.f1_score(y, pred, zero_division=0)
+        rec = metrics.recall_score(y, pred, zero_division=0)
+        prec = metrics.precision_score(y, pred, zero_division=0)
+        if (
+            acc > best["accuracy"]
+            or (acc == best["accuracy"] and f1 > best["f1"])
+            or (acc == best["accuracy"] and f1 == best["f1"] and rec > best["recall"])
+        ):
+            best_thr = float(thr)
+            best = {"accuracy": float(acc), "f1": float(f1), "recall": float(rec), "precision": float(prec)}
+
+    return best_thr, best
+
+
+def find_best_threshold_for_target_recall(
+    y_true: pd.Series, score: pd.Series, target_recall: float = 0.90
+) -> tuple[float, dict]:
+    """
+    Find threshold that reaches target recall first, then maximize precision/F1.
+    Fallback to best recall if target cannot be reached.
+    """
+    y = pd.Series(y_true).astype(int).values
+    s = pd.Series(score).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    candidates = np.unique(np.clip(np.concatenate([np.linspace(0.0, 1.0, 401), s]), 0.0, 1.0))
+    target_recall = float(np.clip(target_recall, 0.0, 1.0))
+
+    feasible = []
+    all_points = []
+    for thr in candidates:
+        pred = (s >= thr).astype(int)
+        acc = metrics.accuracy_score(y, pred)
+        f1 = metrics.f1_score(y, pred, zero_division=0)
+        rec = metrics.recall_score(y, pred, zero_division=0)
+        prec = metrics.precision_score(y, pred, zero_division=0)
+        point = {
+            "threshold": float(thr),
+            "accuracy": float(acc),
+            "f1": float(f1),
+            "recall": float(rec),
+            "precision": float(prec),
+        }
+        all_points.append(point)
+        if rec >= target_recall:
+            feasible.append(point)
+
+    if feasible:
+        best = sorted(
+            feasible,
+            key=lambda x: (x["precision"], x["f1"], x["accuracy"], -x["threshold"]),
+            reverse=True,
+        )[0]
+        return float(best["threshold"]), best
+
+    # Fallback: target unreachable, choose max recall then precision/F1/accuracy.
+    best = sorted(
+        all_points,
+        key=lambda x: (x["recall"], x["precision"], x["f1"], x["accuracy"]),
+        reverse=True,
+    )[0]
+    return float(best["threshold"]), best
+
+
+def calibrate_model_predictions_for_accuracy(
+    df: pd.DataFrame,
+    strategy: str = "accuracy",
+    target_recall: float = 0.90
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Calibrate pred_* columns by selecting thresholds on score_*_norm columns
+    that maximize accuracy on labeled data.
+    """
+    out = df.copy()
+    if not has_binary_ground_truth(out):
+        return out, {}
+
+    y_true = (out['label'].astype(str).str.lower() == 'attack').astype(int)
+    mapping = {
+        "IsolationForest": ("score_iso_norm", "pred_iso"),
+        "OneClassSVM": ("score_ocsvm_norm", "pred_ocsvm"),
+        "DBSCAN": ("score_dbscan_norm", "pred_dbscan"),
+    }
+    if {'score_supervised_norm', 'pred_supervised'}.issubset(out.columns):
+        mapping["SupervisedExtraTrees"] = ("score_supervised_norm", "pred_supervised")
+    if {'score_supervised_rf_norm', 'pred_supervised_rf'}.issubset(out.columns):
+        mapping["SupervisedRandomForest"] = ("score_supervised_rf_norm", "pred_supervised_rf")
+    calibration = {}
+
+    for model_name, (score_col, pred_col) in mapping.items():
+        if score_col not in out.columns:
+            continue
+        if strategy == "target_recall":
+            thr, best = find_best_threshold_for_target_recall(y_true, out[score_col], target_recall=target_recall)
+        else:
+            thr, best = find_best_threshold_for_accuracy(y_true, out[score_col])
+        out[pred_col] = (out[score_col] >= thr).astype(int)
+        calibration[model_name] = {"strategy": strategy, "threshold": thr, **best}
+
+    if {'score_iso_norm', 'score_ocsvm_norm', 'score_dbscan_norm'}.issubset(out.columns):
+        out['score_ensemble_norm'] = (
+            out['score_iso_norm'] + out['score_ocsvm_norm'] + out['score_dbscan_norm']
+        ) / 3.0
+        if strategy == "target_recall":
+            thr, best = find_best_threshold_for_target_recall(
+                y_true, out['score_ensemble_norm'], target_recall=target_recall
+            )
+        else:
+            thr, best = find_best_threshold_for_accuracy(y_true, out['score_ensemble_norm'])
+        out['pred_ensemble'] = (out['score_ensemble_norm'] >= thr).astype(int)
+        calibration["Ensemble"] = {"strategy": strategy, "threshold": thr, **best}
+
+    return out, calibration
+
+
+def train_supervised_showcase_model(df: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, dict]:
+    """
+    Build a supervised showcase model using OOF (out-of-fold) predictions to avoid
+    train-set overfitting metrics in UI.
+    """
+    out = df.copy()
+    if not has_binary_ground_truth(out):
+        return out, {}
+    if not all(f in out.columns for f in features):
+        return out, {}
+
+    y_true = (out['label'].astype(str).str.lower() == 'attack').astype(int)
+    X = out[features].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    et_clf = ExtraTreesClassifier(
+        n_estimators=500,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+        min_samples_leaf=2,
+    )
+    rf_clf = RandomForestClassifier(
+        n_estimators=500,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+        min_samples_leaf=2,
+    )
+
+    et_prob = cross_val_predict(et_clf, X, y_true, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
+    rf_prob = cross_val_predict(rf_clf, X, y_true, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
+
+    out['score_supervised_norm'] = np.clip(et_prob, 0.0, 1.0)
+    out['pred_supervised'] = (out['score_supervised_norm'] >= 0.5).astype(int)
+    out['score_supervised_rf_norm'] = np.clip(rf_prob, 0.0, 1.0)
+    out['pred_supervised_rf'] = (out['score_supervised_rf_norm'] >= 0.5).astype(int)
+
+    metrics_dict = {
+        "eval_mode": "OOF-5Fold",
+        "extra_trees": {
+            "accuracy": float(metrics.accuracy_score(y_true, out['pred_supervised'])),
+            "precision": float(metrics.precision_score(y_true, out['pred_supervised'], zero_division=0)),
+            "recall": float(metrics.recall_score(y_true, out['pred_supervised'], zero_division=0)),
+            "f1": float(metrics.f1_score(y_true, out['pred_supervised'], zero_division=0)),
+            "roc_auc": float(metrics.roc_auc_score(y_true, out['score_supervised_norm'])),
+        },
+        "random_forest": {
+            "accuracy": float(metrics.accuracy_score(y_true, out['pred_supervised_rf'])),
+            "precision": float(metrics.precision_score(y_true, out['pred_supervised_rf'], zero_division=0)),
+            "recall": float(metrics.recall_score(y_true, out['pred_supervised_rf'], zero_division=0)),
+            "f1": float(metrics.f1_score(y_true, out['pred_supervised_rf'], zero_division=0)),
+            "roc_auc": float(metrics.roc_auc_score(y_true, out['score_supervised_rf_norm'])),
+        },
+    }
+    return out, metrics_dict
 
 # Sidebar
 with st.sidebar:
@@ -555,13 +807,28 @@ with st.sidebar:
         )
 
         if data_source == "生成新数据":
+            generator_for_ui = DataGenerator()
+            attack_catalog = generator_for_ui.get_attack_catalog()
+            preset_map = {
+                "基础演示（经典4类）": ["port_scan", "brute_force", "data_exfiltration", "dos"],
+                "规则强化（扫描+破解+DNS）": ["port_scan", "slow_scan", "brute_force", "dns_tunnel", "periodic_beacon"],
+                "AI强化（外传+变异+混淆）": ["data_exfiltration", "low_slow_exfiltration", "protocol_mismatch", "periodic_beacon"],
+                "综合全量": list(attack_catalog.keys()),
+                "自定义": [],
+            }
+            attack_preset = st.selectbox("攻击场景模板", list(preset_map.keys()), index=3)
             n_normal = st.slider("正常流量条数", 100, 10000, 2000, 100)
             n_attack = st.slider("攻击流量条数", 10, 5000, 500, 10)
+            default_attack_types = preset_map.get(attack_preset, [])
+            if attack_preset == "自定义":
+                default_attack_types = ["port_scan", "brute_force", "data_exfiltration", "dos"]
             attack_types = st.multiselect(
                 "攻击类型",
-                ["port_scan", "brute_force", "data_exfiltration", "dos"],
-                ["port_scan", "brute_force", "data_exfiltration", "dos"]
+                list(attack_catalog.keys()),
+                default_attack_types,
+                format_func=lambda x: f"{x} - {attack_catalog.get(x, '')}",
             )
+            st.caption("提示：该数据源带有真值标签，可完整展示准确率、召回率、混淆矩阵、攻击类型分布。")
         elif data_source == "上传 CSV":
             uploaded_file = st.file_uploader("上传网络流量 CSV 文件", type=["csv"])
         elif data_source == "上传 PCAP":
@@ -629,6 +896,25 @@ with st.sidebar:
         dbscan_eps = st.slider("DBSCAN Epsilon", 0.1, 2.0, 0.5, 0.1)
         dbscan_min_samples = st.slider("DBSCAN 最小样本数", 2, 20, 5, 1)
         anomaly_threshold = st.slider("异常分数阈值", 0.0, 1.0, 0.8, 0.05)
+        threshold_calibration_strategy = st.selectbox(
+            "阈值自动校准策略",
+            ["准确率优先", "低漏报优先（目标召回）"],
+            index=1,
+            help="低漏报优先会尽量把漏报率压低（通常会增加误报）。"
+        )
+        target_recall = st.slider(
+            "目标召回率（仅低漏报策略生效）",
+            min_value=0.70,
+            max_value=0.99,
+            value=0.90,
+            step=0.01
+        )
+        st.caption("目标召回=0.90 约等价于漏报率<=10%（在当前数据可达时）。")
+        enable_supervised_showcase = st.checkbox(
+            "启用监督模型（ExtraTrees/RandomForest）",
+            value=True,
+            help="仅在存在 attack/normal 真值标签时生效，用于提升展示与对比效果。"
+        )
 
         enable_simulation = st.checkbox("启用实时仿真", value=False)
         if enable_simulation:
@@ -673,6 +959,10 @@ with st.sidebar:
         run_rules_button = st.button("执行规则检测", width="stretch")
         generate_button = st.button("处理数据", width="stretch")
 
+threshold_calibration_mode = (
+    "target_recall" if threshold_calibration_strategy == "低漏报优先（目标召回）" else "accuracy"
+)
+
 # Main content
 st.title("智能网络威胁检测平台")
 st.markdown(
@@ -705,6 +995,8 @@ if 'sim_auto_refresh' not in st.session_state:
     st.session_state['sim_auto_refresh'] = True
 if 'sim_source_df' not in st.session_state:
     st.session_state['sim_source_df'] = None
+if 'sim_flow_queue' not in st.session_state:
+    st.session_state['sim_flow_queue'] = queue.Queue(maxsize=5000)
 if 'models' not in st.session_state:
     st.session_state['models'] = {}
 if 'pcap_df' not in st.session_state:
@@ -727,6 +1019,8 @@ if 'agent_report_markdown' not in st.session_state:
     st.session_state['agent_report_markdown'] = ""
 if 'agent_context' not in st.session_state:
     st.session_state['agent_context'] = {}
+if 'agent_chat_messages' not in st.session_state:
+    st.session_state['agent_chat_messages'] = []
 
 def _render_status_cards(target, current_data_source: str) -> None:
     flow_df = st.session_state.get("flows_df")
@@ -808,6 +1102,12 @@ if generate_button or start_capture_button:
 
             # Score flows
             df = generator.score_flows(df, iso_model, ocsvm_model, ocsvm_scaler, dbscan_model, dbscan_scaler)
+            df, calibration = calibrate_model_predictions_for_accuracy(
+                df,
+                strategy=threshold_calibration_mode,
+                target_recall=target_recall,
+            )
+            st.session_state['calibrated_thresholds'] = calibration
 
             # Store models
             st.session_state['models'] = {
@@ -869,6 +1169,12 @@ if generate_button or start_capture_button:
 
                         # Score flows
                         df = generator.score_flows(df, iso_model, ocsvm_model, ocsvm_scaler, dbscan_model, dbscan_scaler)
+                        df, calibration = calibrate_model_predictions_for_accuracy(
+                            df,
+                            strategy=threshold_calibration_mode,
+                            target_recall=target_recall,
+                        )
+                        st.session_state['calibrated_thresholds'] = calibration
 
                         # Store models
                         st.session_state['models'] = {
@@ -881,6 +1187,8 @@ if generate_button or start_capture_button:
 
                     # Store dataframe
                     st.session_state['df'] = df
+                    if 'calibrated_thresholds' not in st.session_state:
+                        st.session_state['calibrated_thresholds'] = {}
                     st.session_state['flows_df'] = None
                     st.session_state['simulation_running'] = False
                     st.session_state['capture_source'] = "csv"
@@ -934,6 +1242,12 @@ if generate_button or start_capture_button:
                             dbscan_model,
                             dbscan_scaler
                         )
+                        flows_df, calibration = calibrate_model_predictions_for_accuracy(
+                            flows_df,
+                            strategy=threshold_calibration_mode,
+                            target_recall=target_recall,
+                        )
+                        st.session_state['calibrated_thresholds'] = calibration
 
                         st.session_state['models'] = {
                             'iso': iso_model,
@@ -1057,6 +1371,12 @@ if generate_button or start_capture_button:
                         dbscan_model,
                         dbscan_scaler
                     )
+                    flows_df, calibration = calibrate_model_predictions_for_accuracy(
+                        flows_df,
+                        strategy=threshold_calibration_mode,
+                        target_recall=target_recall,
+                    )
+                    st.session_state['calibrated_thresholds'] = calibration
                     st.session_state["models"] = {
                         "iso": iso_model,
                         "ocsvm": ocsvm_model,
@@ -1464,6 +1784,26 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
         label_lower = df['label'].astype(str).str.lower()
         has_ground_truth = label_lower.nunique() >= 2 and ('attack' in set(label_lower)) and ('normal' in set(label_lower))
         y_true = (label_lower == 'attack').astype(int)
+    if has_ground_truth:
+        if enable_supervised_showcase:
+            feature_cols_local = DataGenerator().get_feature_columns()
+            df, supervised_metrics = train_supervised_showcase_model(df, feature_cols_local)
+            if supervised_metrics:
+                st.session_state['supervised_showcase_metrics'] = supervised_metrics
+        # Auto-calibrate model thresholds on labeled datasets.
+        calibrated_df, calibration = calibrate_model_predictions_for_accuracy(
+            df,
+            strategy=threshold_calibration_mode,
+            target_recall=target_recall,
+        )
+        df = calibrated_df
+        if st.session_state.get('flows_df') is not None:
+            st.session_state['flows_df'] = calibrated_df
+        else:
+            st.session_state['df'] = calibrated_df
+        st.session_state['calibrated_thresholds'] = calibration
+    else:
+        st.session_state['supervised_showcase_metrics'] = {}
     if run_rules_button:
         try:
             port_scan_alerts = detect_port_scan(
@@ -1574,12 +1914,17 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             st.info("当前数据缺少可用攻击真值标签（如实时抓包场景），已跳过监督评估指标（ROC/PR/混淆矩阵）。")
         else:
             metrics_list = []
-
-            for name, pred_col, score_col in [
+            comparison_models = [
                 ('IsolationForest', 'pred_iso', 'score_iso_norm'),
                 ('OneClassSVM', 'pred_ocsvm', 'score_ocsvm_norm'),
                 ('DBSCAN', 'pred_dbscan', 'score_dbscan_norm')
-            ]:
+            ]
+            if 'pred_supervised' in df.columns and 'score_supervised_norm' in df.columns:
+                comparison_models.insert(0, ('ExtraTrees', 'pred_supervised', 'score_supervised_norm'))
+            if 'pred_supervised_rf' in df.columns and 'score_supervised_rf_norm' in df.columns:
+                comparison_models.insert(1, ('RandomForest', 'pred_supervised_rf', 'score_supervised_rf_norm'))
+
+            for name, pred_col, score_col in comparison_models:
                 try:
                     roc = metrics.roc_auc_score(y_true, df[score_col])
                 except Exception:
@@ -1610,16 +1955,20 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             st.dataframe(metrics_df.style.format({
                 'ROC AUC': "{:.3f}", '精确率': "{:.3f}", '召回率': "{:.3f}", 'F1 分数': "{:.3f}"
             }))
-
             # Confusion matrices
             st.header("混淆矩阵")
 
-            cols = st.columns(3)
-            for i, (name, pred_col) in enumerate([
+            confusion_models = [
                 ('IsolationForest', 'pred_iso'),
                 ('OneClassSVM', 'pred_ocsvm'),
                 ('DBSCAN', 'pred_dbscan')
-            ]):
+            ]
+            if 'pred_supervised' in df.columns:
+                confusion_models.insert(0, ('ExtraTrees', 'pred_supervised'))
+            if 'pred_supervised_rf' in df.columns:
+                confusion_models.insert(1, ('RandomForest', 'pred_supervised_rf'))
+            cols = st.columns(len(confusion_models))
+            for i, (name, pred_col) in enumerate(confusion_models):
                 with cols[i]:
                     st.subheader(name)
                     try:
@@ -1655,6 +2004,10 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     'OneClassSVM': df['score_ocsvm_norm'],
                     'DBSCAN': df['score_dbscan_norm']
                 }
+                if 'score_supervised_norm' in df.columns:
+                    y_scores_dict = {'ExtraTrees': df['score_supervised_norm'], **y_scores_dict}
+                if 'score_supervised_rf_norm' in df.columns:
+                    y_scores_dict = {'RandomForest': df['score_supervised_rf_norm'], **y_scores_dict}
                 fig_roc = plot_roc_curve(y_true, y_scores_dict)
                 st.pyplot(fig_roc)
 
@@ -1837,19 +2190,34 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             )
 
         # Model selection
-        model_display = st.selectbox(
-            "选择异常检测模型",
-            ["孤立森林", "单类 SVM", "DBSCAN", "集成模型（多数投票）"]
-        )
+        model_options = ["孤立森林", "单类 SVM", "DBSCAN", "集成模型（多数投票）"]
         model_choice_map = {
             "孤立森林": "IsolationForest",
             "单类 SVM": "OneClassSVM",
             "DBSCAN": "DBSCAN",
             "集成模型（多数投票）": "Ensemble (Majority Vote)"
         }
+        if 'score_supervised_norm' in df.columns and 'pred_supervised' in df.columns:
+            model_options.insert(0, "ExtraTrees")
+            model_choice_map["ExtraTrees"] = "SupervisedExtraTrees"
+        if 'score_supervised_rf_norm' in df.columns and 'pred_supervised_rf' in df.columns:
+            model_options.insert(1, "RandomForest")
+            model_choice_map["RandomForest"] = "SupervisedRandomForest"
+        model_display = st.selectbox(
+            "选择异常检测模型",
+            model_options
+        )
         model_choice = model_choice_map[model_display]
 
-        if model_choice == "IsolationForest":
+        if model_choice == "SupervisedExtraTrees":
+            score_col = 'score_supervised_norm'
+            pred_col = 'pred_supervised'
+            model = st.session_state['models'].get('supervised')
+        elif model_choice == "SupervisedRandomForest":
+            score_col = 'score_supervised_rf_norm'
+            pred_col = 'pred_supervised_rf'
+            model = st.session_state['models'].get('supervised_rf')
+        elif model_choice == "IsolationForest":
             score_col = 'score_iso_norm'
             pred_col = 'pred_iso'
             model = st.session_state['models'].get('iso')
@@ -1876,12 +2244,27 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             pred_col = 'pred_ensemble'
             model = None  # No single model for ensemble
 
+        calibrated_thresholds = st.session_state.get('calibrated_thresholds', {})
+        recommended_threshold = anomaly_threshold
+        if has_ground_truth and model_choice in calibrated_thresholds:
+            recommended_threshold = float(calibrated_thresholds[model_choice].get('threshold', anomaly_threshold))
+            strategy_text = "低漏报优先" if threshold_calibration_mode == "target_recall" else "准确率优先"
+            st.caption(f"已按{strategy_text}自动校准：推荐阈值 `{recommended_threshold:.3f}`（当前模型）")
+        elif model_choice in ("SupervisedExtraTrees", "SupervisedRandomForest"):
+            recommended_threshold = 0.5
+
+        col_thr1, col_thr2 = st.columns([3, 1])
+        with col_thr2:
+            use_recommended_thr = st.button("使用推荐阈值", key="use_recommended_threshold_btn", width="stretch")
+        if use_recommended_thr:
+            st.session_state["anomaly_threshold_slider"] = float(recommended_threshold)
+
         # 异常阈值ing
         threshold = st.slider(
             "用于告警的异常分数阈值",
             min_value=0.0,
             max_value=1.0,
-            value=anomaly_threshold,
+            value=float(st.session_state.get("anomaly_threshold_slider", recommended_threshold)),
             step=0.05,
             key="anomaly_threshold_slider"
         )
@@ -1974,22 +2357,24 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     st.metric("告警占比", f"{(len(anomalies)/max(1, len(df))):.1%}")
 
             with col2:
-                # 告警中的攻击类型分布
-                if 'attack_type' in anomalies.columns:
-                    attack_distribution = anomalies[anomalies['label'] == 'attack']['attack_type'].value_counts()
-                    st.markdown("**检测到的攻击类型：**")
-                    if len(attack_distribution) > 0:
-                        for attack_type, count in attack_distribution.items():
-                            st.markdown(f"- {attack_type}: {count}")
+                # 告警中的攻击类型分布（无标签场景也做规则名兜底）
+                st.markdown("**检测到的攻击类型：**")
+                attack_distribution = pd.Series(dtype="int64")
+                if "attack_type" in anomalies.columns:
+                    clean_attack = anomalies["attack_type"].fillna("").astype(str).str.strip()
+                    attack_distribution = clean_attack[clean_attack != ""].value_counts()
+
+                if len(attack_distribution) > 0:
+                    for attack_type, count in attack_distribution.items():
+                        st.markdown(f"- {attack_type}: {count}")
+                else:
+                    alerts_df_for_types = st.session_state.get("rule_alerts_df")
+                    if isinstance(alerts_df_for_types, pd.DataFrame) and not alerts_df_for_types.empty and "rule_name" in alerts_df_for_types.columns:
+                        rule_counts = alerts_df_for_types["rule_name"].astype(str).value_counts()
+                        for rule_name, count in rule_counts.items():
+                            st.markdown(f"- {rule_name}: {count}")
                     else:
-                        # Live/PCAP unlabeled scenario fallback: use rule hits as attack-type proxy.
-                        alerts_df_for_types = st.session_state.get("rule_alerts_df")
-                        if isinstance(alerts_df_for_types, pd.DataFrame) and not alerts_df_for_types.empty:
-                            rule_counts = alerts_df_for_types["rule_name"].astype(str).value_counts()
-                            for rule_name, count in rule_counts.items():
-                                st.markdown(f"- {rule_name}: {count}")
-                        else:
-                            st.markdown("- 当前无可归类攻击类型（实时无标签场景）")
+                        st.markdown("- 当前无可归类攻击类型（实时无标签场景）")
 
         # Anomaly score distribution
         st.subheader("异常分数分布")
@@ -2181,11 +2566,16 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             # Initialize session state for real-time data.
             if 'real_time_flows' not in st.session_state:
                 st.session_state['real_time_flows'] = []
+            if 'real_time_flow_history' not in st.session_state:
+                st.session_state['real_time_flow_history'] = []
             if 'alert_count' not in st.session_state:
                 st.session_state['alert_count'] = 0
+            if 'sim_last_rerun_ts' not in st.session_state:
+                st.session_state['sim_last_rerun_ts'] = 0.0
             if df is None or not isinstance(df, pd.DataFrame) or df.empty or 'timestamp' not in df.columns:
                 st.warning("当前数据不支持仿真回放。请先点击“处理数据”，并确保存在 `timestamp` 字段。")
             else:
+                sim_flow_queue = st.session_state['sim_flow_queue']
                 # Control actions for simulation lifecycle.
                 ctl1, ctl2, ctl3, ctl4 = st.columns(4)
                 with ctl1:
@@ -2203,13 +2593,14 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     if old_stop_event is not None:
                         old_stop_event.set()
 
-                    while not flow_queue.empty():
+                    while not sim_flow_queue.empty():
                         try:
-                            flow_queue.get_nowait()
+                            sim_flow_queue.get_nowait()
                         except queue.Empty:
                             break
 
                     st.session_state['real_time_flows'] = []
+                    st.session_state['real_time_flow_history'] = []
                     st.session_state['alert_count'] = 0
                     st.session_state['sim_total_emitted'] = 0
                     sim_source_df = df.copy()
@@ -2217,7 +2608,7 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     st.session_state['sim_total_source'] = int(len(sim_source_df))
 
                     stop_event = threading.Event()
-                    simulator = create_flow_simulator(sim_source_df, speed_factor, flow_queue, stop_event=stop_event)
+                    simulator = create_flow_simulator(sim_source_df, speed_factor, sim_flow_queue, stop_event=stop_event)
                     simulator.daemon = True
                     simulator.start()
 
@@ -2242,20 +2633,21 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     st.session_state['sim_thread'] = None
                     st.session_state['sim_stop_event'] = None
                     st.session_state['real_time_flows'] = []
+                    st.session_state['real_time_flow_history'] = []
                     st.session_state['alert_count'] = 0
                     st.session_state['sim_total_emitted'] = 0
                     st.session_state['sim_total_source'] = int(len(df))
                     st.session_state['sim_source_df'] = None
-                    while not flow_queue.empty():
+                    while not sim_flow_queue.empty():
                         try:
-                            flow_queue.get_nowait()
+                            sim_flow_queue.get_nowait()
                         except queue.Empty:
                             break
                     st.success("已重置仿真回放状态。")
 
                 sim_thread = st.session_state.get('sim_thread')
                 if st.session_state.get('simulation_running', False) and sim_thread is not None:
-                    if (not sim_thread.is_alive()) and flow_queue.empty():
+                    if (not sim_thread.is_alive()) and sim_flow_queue.empty():
                         st.session_state['simulation_running'] = False
                         st.session_state['sim_thread'] = None
                         st.info("仿真回放已结束。可点击“启动仿真回放”再次开始。")
@@ -2270,34 +2662,56 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                 with col1:
                     auto_scroll = st.checkbox(
                         "自动滚动到最新",
-                        value=st.session_state.get('sim_auto_refresh', True),
+                        value=st.session_state.get('sim_auto_refresh', False),
                         key="sim_auto_refresh_checkbox"
                     )
                     st.session_state['sim_auto_refresh'] = auto_scroll
                 with col2:
-                    max_flows = st.number_input("最大显示流量数", min_value=10, max_value=1000, value=50, step=10)
+                    max_flows = st.number_input(
+                        "最大显示流量数",
+                        min_value=10,
+                        max_value=1000,
+                        value=50,
+                        step=10,
+                        key="sim_max_flows_input"
+                    )
+                refresh_interval_s = st.slider(
+                    "自动刷新间隔（秒）",
+                    min_value=0.5,
+                    max_value=3.0,
+                    value=float(st.session_state.get('sim_refresh_interval_s', 1.2)),
+                    step=0.1,
+                    key="sim_refresh_interval_slider",
+                    help="间隔越小越实时，但页面闪烁更明显。"
+                )
+                st.session_state['sim_refresh_interval_s'] = float(refresh_interval_s)
 
                 # Get new flows from queue
                 new_flows = []
-                while not flow_queue.empty():
+                thread_error = None
+                while not sim_flow_queue.empty():
                     try:
-                        flow = flow_queue.get_nowait()
+                        flow = sim_flow_queue.get_nowait()
+                        if isinstance(flow, dict) and "__sim_error" in flow:
+                            thread_error = str(flow.get("__sim_error"))
+                            continue
                         new_flows.append(flow)
                     except queue.Empty:
                         break
 
+                if thread_error:
+                    st.session_state['simulation_running'] = False
+                    st.session_state['sim_thread'] = None
+                    st.error(f"仿真线程异常：{thread_error}")
+
                 st.session_state['sim_total_emitted'] = st.session_state.get('sim_total_emitted', 0) + len(new_flows)
 
                 # Add to session state
-                st.session_state['real_time_flows'].extend(new_flows)
-
-                # Keep only the latest flows
-                if len(st.session_state['real_time_flows']) > max_flows:
-                    st.session_state['real_time_flows'] = st.session_state['real_time_flows'][-max_flows:]
+                st.session_state['real_time_flow_history'].extend(new_flows)
 
                 # Convert to DataFrame
-                if st.session_state['real_time_flows']:
-                    live_df = pd.DataFrame(st.session_state['real_time_flows'])
+                if st.session_state['real_time_flow_history']:
+                    history_df = pd.DataFrame(st.session_state['real_time_flow_history'])
                     sim_ref_df = st.session_state.get('sim_source_df')
                     if not isinstance(sim_ref_df, pd.DataFrame) or sim_ref_df.empty:
                         sim_ref_df = df
@@ -2305,8 +2719,8 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     # Score the flows using the selected model
                     if 'iso' in st.session_state['models'] and model_choice == "IsolationForest":
                         iso_model = st.session_state['models']['iso']
-                        live_features = live_df[features]
-                        live_df['score'] = -iso_model.decision_function(live_features)
+                        live_features = history_df[features]
+                        history_df['score'] = -iso_model.decision_function(live_features)
 
                         # 正常ize score
                         score_ref_col = 'score_iso' if 'score_iso' in sim_ref_df.columns else None
@@ -2316,23 +2730,23 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                             min_val = sim_ref_df[score_ref_col].min()
                             max_val = sim_ref_df[score_ref_col].max()
                         else:
-                            min_val = float(live_df['score'].min())
-                            max_val = float(live_df['score'].max())
+                            min_val = float(history_df['score'].min())
+                            max_val = float(history_df['score'].max())
                         if max_val > min_val:
-                            live_df['score_norm'] = (live_df['score'] - min_val) / (max_val - min_val)
+                            history_df['score_norm'] = (history_df['score'] - min_val) / (max_val - min_val)
                         else:
-                            live_df['score_norm'] = 0
+                            history_df['score_norm'] = 0
 
                         # Apply threshold
-                        live_df['is_alert'] = (live_df['score_norm'] >= threshold).astype(int)
+                        history_df['is_alert'] = (history_df['score_norm'] >= threshold).astype(int)
 
                     elif 'ocsvm' in st.session_state['models'] and 'ocsvm_scaler' in st.session_state['models'] and model_choice == "OneClassSVM":
                         ocsvm_model = st.session_state['models']['ocsvm']
                         ocsvm_scaler = st.session_state['models']['ocsvm_scaler']
 
-                        live_features = live_df[features]
+                        live_features = history_df[features]
                         X_scaled = ocsvm_scaler.transform(live_features)
-                        live_df['score'] = -ocsvm_model.decision_function(X_scaled)
+                        history_df['score'] = -ocsvm_model.decision_function(X_scaled)
 
                         # 正常ize score
                         score_ref_col = 'score_ocsvm' if 'score_ocsvm' in sim_ref_df.columns else None
@@ -2342,32 +2756,32 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                             min_val = sim_ref_df[score_ref_col].min()
                             max_val = sim_ref_df[score_ref_col].max()
                         else:
-                            min_val = float(live_df['score'].min())
-                            max_val = float(live_df['score'].max())
+                            min_val = float(history_df['score'].min())
+                            max_val = float(history_df['score'].max())
                         if max_val > min_val:
-                            live_df['score_norm'] = (live_df['score'] - min_val) / (max_val - min_val)
+                            history_df['score_norm'] = (history_df['score'] - min_val) / (max_val - min_val)
                         else:
-                            live_df['score_norm'] = 0
+                            history_df['score_norm'] = 0
 
                         # Apply threshold
-                        live_df['is_alert'] = (live_df['score_norm'] >= threshold).astype(int)
+                        history_df['is_alert'] = (history_df['score_norm'] >= threshold).astype(int)
 
                     elif 'dbscan' in st.session_state['models'] and 'dbscan_scaler' in st.session_state['models'] and model_choice == "DBSCAN":
                         dbscan_model = st.session_state['models']['dbscan']
                         dbscan_scaler = st.session_state['models']['dbscan_scaler']
 
-                        live_features = live_df[features]
+                        live_features = history_df[features]
                         X_scaled = dbscan_scaler.transform(live_features)
-                        live_df['pred'] = dbscan_model.fit_predict(X_scaled)
-                        live_df['score_norm'] = (live_df['pred'] == -1).astype(float)
+                        history_df['pred'] = dbscan_model.fit_predict(X_scaled)
+                        history_df['score_norm'] = (history_df['pred'] == -1).astype(float)
 
                         # Apply threshold
-                        live_df['is_alert'] = (live_df['score_norm'] >= threshold).astype(int)
+                        history_df['is_alert'] = (history_df['score_norm'] >= threshold).astype(int)
 
                     else:  # Ensemble or fallback
                         # Use a simple heuristic if models aren't available
                         if (
-                            'byte_rate' in live_df.columns and 'duration_ms' in live_df.columns
+                            'byte_rate' in history_df.columns and 'duration_ms' in history_df.columns
                             and 'byte_rate' in sim_ref_df.columns and 'duration_ms' in sim_ref_df.columns
                         ):
                             # Flag very high byte rates or very short/long durations
@@ -2375,37 +2789,45 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                             duration_low = sim_ref_df['duration_ms'].quantile(0.05)
                             duration_high = sim_ref_df['duration_ms'].quantile(0.95)
 
-                            live_df['score_norm'] = 0.0
+                            history_df['score_norm'] = 0.0
                             # Set high score for unusual byte rates or durations
-                            live_df.loc[live_df['byte_rate'] > byte_rate_threshold, 'score_norm'] = 0.8
-                            live_df.loc[live_df['duration_ms'] < duration_low, 'score_norm'] = 0.8
-                            live_df.loc[live_df['duration_ms'] > duration_high, 'score_norm'] = 0.7
+                            history_df.loc[history_df['byte_rate'] > byte_rate_threshold, 'score_norm'] = 0.8
+                            history_df.loc[history_df['duration_ms'] < duration_low, 'score_norm'] = 0.8
+                            history_df.loc[history_df['duration_ms'] > duration_high, 'score_norm'] = 0.7
 
-                            live_df['is_alert'] = (live_df['score_norm'] >= threshold).astype(int)
+                            history_df['is_alert'] = (history_df['score_norm'] >= threshold).astype(int)
                         else:
                             # If no features available, don't score
-                            live_df['score_norm'] = 0.0
-                            live_df['is_alert'] = 0
+                            history_df['score_norm'] = 0.0
+                            history_df['is_alert'] = 0
 
-                    # Update alert count
-                    new_alerts = int(live_df['is_alert'].sum()) if 'is_alert' in live_df.columns else 0
-                    st.session_state['alert_count'] = new_alerts
+                    # Build a display window from latest records only.
+                    st.session_state['real_time_flows'] = history_df.tail(int(max_flows)).to_dict('records')
+                    live_df = pd.DataFrame(st.session_state['real_time_flows'])
+
+                    # Update cumulative alert count (history-level, not display-window-level).
+                    total_alerts = int(history_df['is_alert'].sum()) if 'is_alert' in history_df.columns else 0
+                    st.session_state['alert_count'] = total_alerts
 
                     # Display alerts
                     with alert_container:
-                        alert_col1, alert_col2 = st.columns(2)
+                        alert_col1, alert_col2, alert_col3 = st.columns(3)
                         with alert_col1:
                             st.metric("总告警数", st.session_state['alert_count'])
                             total_source = st.session_state.get('sim_total_source', int(len(df)))
-                            emitted = st.session_state.get('sim_total_emitted', len(live_df))
+                            emitted = st.session_state.get('sim_total_emitted', len(history_df))
                             st.caption(f"回放进度：{emitted}/{total_source}")
                         with alert_col2:
+                            st.metric("累计回放流", int(len(history_df)))
+                            alert_ratio = (st.session_state['alert_count'] / max(1, len(history_df))) * 100
+                            st.caption(f"告警占比：{alert_ratio:.1f}%")
+                        with alert_col3:
                             # Get most recent alert
-                            if new_alerts > 0:
-                                last_alert = live_df[live_df['is_alert'] == 1].iloc[-1]
+                            if st.session_state['alert_count'] > 0:
+                                last_alert = history_df[history_df['is_alert'] == 1].iloc[-1]
                                 st.markdown(f"""
                             <div class="alert-box">
-                                <strong>鈿狅笍 新告警！</strong><br>
+                                <strong>新告警！</strong><br>
                                 源： {last_alert['src_ip']}:{last_alert['src_port']}<br>
                                 目标： {last_alert['dst_ip']}:{last_alert['dst_port']}<br>
                                 Score: {last_alert['score_norm']:.3f}
@@ -2464,8 +2886,8 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                         st.subheader("实时指标")
 
                         # Prepare time series data
-                        live_df['minute'] = pd.to_datetime(live_df['timestamp']).dt.floor('min')
-                        time_series = live_df.groupby('minute').agg({
+                        history_df['minute'] = pd.to_datetime(history_df['timestamp']).dt.floor('min')
+                        time_series = history_df.groupby('minute').agg({
                             'flow_id': 'count',
                             'is_alert': 'sum'
                         }).reset_index()
@@ -2507,8 +2929,13 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                     and st.session_state.get('sim_auto_refresh', True)
                     and (not refresh_sim_frame)
                 ):
-                    time.sleep(0.4)
-                    st.rerun()
+                    now_ts = time.time()
+                    last_ts = float(st.session_state.get('sim_last_rerun_ts', 0.0))
+                    interval_s = float(st.session_state.get('sim_refresh_interval_s', 1.2))
+                    if now_ts - last_ts >= interval_s:
+                        st.session_state['sim_last_rerun_ts'] = now_ts
+                        time.sleep(0.05)
+                        st.rerun()
 
         else:
             st.info("请在侧栏启用实时仿真以查看实时流量。")
@@ -2937,33 +3364,37 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
             st.metric("报告字符数", len(report_markdown))
 
         st.subheader("报告预览")
-        st.code(report_markdown[:4000], language="markdown")
+        st.markdown(report_markdown[:8000])
+        with st.expander("查看原始 Markdown 文本", expanded=False):
+            st.code(report_markdown[:8000], language="markdown")
 
-        st.subheader("LLM 威胁研判")
-        if st.button("生成LLM研判", width="stretch"):
-            anomalies_for_assess = None
-            if "is_alert" in df.columns:
-                anomalies_for_assess = df[df["is_alert"] == 1].copy()
-            elif "score_ensemble_norm" in df.columns:
-                anomalies_for_assess = df.sort_values("score_ensemble_norm", ascending=False).head(50)
-            else:
-                anomalies_for_assess = df.head(50)
+        with st.expander("LLM 威胁研判（可选）", expanded=False):
+            if st.button("生成LLM研判", width="stretch"):
+                anomalies_for_assess = None
+                if "is_alert" in df.columns:
+                    anomalies_for_assess = df[df["is_alert"] == 1].copy()
+                elif "score_ensemble_norm" in df.columns:
+                    anomalies_for_assess = df.sort_values("score_ensemble_norm", ascending=False).head(50)
+                else:
+                    anomalies_for_assess = df.head(50)
 
-            st.session_state["llm_assessment"] = generate_threat_assessment(
-                alerts_df=st.session_state.get("rule_alerts_df"),
-                anomalies_df=anomalies_for_assess,
-                provider={
-                    "自动": "auto",
-                    "DeepSeek": "deepseek",
-                    "OpenAI": "openai",
-                }.get(llm_provider_display, "auto"),
-                model=(llm_model_name.strip() if llm_model_name else "auto"),
-                api_key=(llm_api_key_input.strip() if llm_api_key_input else None),
-                base_url=(llm_base_url_input.strip() if llm_base_url_input else None),
-            )
+                st.session_state["llm_assessment"] = generate_threat_assessment(
+                    alerts_df=st.session_state.get("rule_alerts_df"),
+                    anomalies_df=anomalies_for_assess,
+                    provider={
+                        "自动": "auto",
+                        "DeepSeek": "deepseek",
+                        "OpenAI": "openai",
+                    }.get(llm_provider_display, "auto"),
+                    model=(llm_model_name.strip() if llm_model_name else "auto"),
+                    api_key=(llm_api_key_input.strip() if llm_api_key_input else None),
+                    base_url=(llm_base_url_input.strip() if llm_base_url_input else None),
+                    timeout_s=60,
+                    max_retries=2,
+                )
 
-        if st.session_state.get("llm_assessment"):
-            st.text_area("研判输出", st.session_state["llm_assessment"], height=240)
+            if st.session_state.get("llm_assessment"):
+                st.text_area("研判输出", st.session_state["llm_assessment"], height=240)
 
     # Tab 11: AI Agent
     with tab11:
@@ -3003,6 +3434,8 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                 model=(llm_model_name.strip() if llm_model_name else "auto"),
                 api_key=(llm_api_key_input.strip() if llm_api_key_input else None),
                 base_url=(llm_base_url_input.strip() if llm_base_url_input else None),
+                timeout_s=60,
+                max_retries=2,
             )
             st.session_state["agent_context"] = result.get("context", {})
             st.session_state["llm_assessment"] = result.get("llm_assessment", "")
@@ -3042,7 +3475,65 @@ if analysis_df is not None and isinstance(analysis_df, pd.DataFrame) and not ana
                 mime="text/markdown",
                 width="stretch",
             )
-            st.code(st.session_state["agent_report_markdown"][:6000], language="markdown")
+            st.markdown(st.session_state["agent_report_markdown"][:8000])
+            with st.expander("查看原始 Agent Markdown 文本", expanded=False):
+                st.code(st.session_state["agent_report_markdown"][:8000], language="markdown")
+
+        st.subheader("Agent 对话研判")
+        st.caption(
+            "可直接就本次抓包与检测结果提问。"
+            "对话会自动携带当前会话的结构化分析上下文，默认使用环境变量 DEEPSEEK_API_KEY。"
+        )
+
+        chat_col1, chat_col2 = st.columns([1, 1])
+        with chat_col1:
+            if st.button("清空对话", key="agent_chat_clear_btn", width="stretch"):
+                st.session_state["agent_chat_messages"] = []
+        with chat_col2:
+            has_deepseek_key = bool((llm_api_key_input or os.getenv("DEEPSEEK_API_KEY") or "").strip())
+            st.metric("DeepSeek Key 状态", "已就绪" if has_deepseek_key else "未检测到")
+
+        chat_history = st.session_state.get("agent_chat_messages", [])
+        for msg in chat_history:
+            role = str(msg.get("role", "")).strip().lower()
+            content = str(msg.get("content", "")).strip()
+            if role in {"user", "assistant"} and content:
+                with st.chat_message(role):
+                    st.markdown(content)
+
+        user_question = st.chat_input("请输入你的问题（例如：本次告警最值得优先处置的主机是哪台？）", key="agent_chat_input")
+        if user_question:
+            st.session_state["agent_chat_messages"].append({"role": "user", "content": user_question})
+            with st.chat_message("user"):
+                st.markdown(user_question)
+
+            context_payload = build_agent_chat_context(
+                analysis_df=df,
+                packet_df=st.session_state.get("pcap_df"),
+                alerts_df=st.session_state.get("rule_alerts_df"),
+                incident_df=st.session_state.get("incident_df"),
+                action_df=st.session_state.get("response_actions_df"),
+                agent_ctx=st.session_state.get("agent_context"),
+                llm_assessment=st.session_state.get("llm_assessment", ""),
+            )
+            chat_model = (llm_model_name.strip() if llm_model_name else "deepseek-chat")
+            if chat_model.lower() in {"", "auto"}:
+                chat_model = "deepseek-chat"
+
+            with st.chat_message("assistant"):
+                with st.spinner("正在结合本次分析结果生成回答..."):
+                    assistant_reply = generate_contextual_chat_reply(
+                        question=user_question,
+                        context=context_payload,
+                        history=st.session_state["agent_chat_messages"][:-1],
+                        model=chat_model,
+                        api_key=(llm_api_key_input.strip() if llm_api_key_input else None),
+                        base_url=(llm_base_url_input.strip() if llm_base_url_input else None),
+                        timeout_s=60,
+                        max_retries=2,
+                    )
+                st.markdown(assistant_reply)
+            st.session_state["agent_chat_messages"].append({"role": "assistant", "content": assistant_reply})
 
 # Footer (fixed bottom)
 st.markdown(
@@ -3051,6 +3542,3 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-
-

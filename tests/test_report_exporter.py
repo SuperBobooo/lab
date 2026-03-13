@@ -56,3 +56,4 @@ def test_build_markdown_report_contains_incident_and_action_sections():
     assert "响应动作审计" in content
     assert "LLM 威胁研判" in content
     assert "PORT_SCAN" in content
+

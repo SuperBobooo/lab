@@ -177,7 +177,8 @@ def run_agent_assessment(
     provider: str = "auto",
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
-    timeout_s: int = 45,
+    timeout_s: int = 60,
+    max_retries: int = 2,
 ) -> Dict[str, Any]:
     """End-to-end agent run: context -> LLM text -> markdown report."""
     context = build_agent_context(
@@ -199,6 +200,7 @@ def run_agent_assessment(
         api_key=api_key,
         base_url=base_url,
         timeout_s=timeout_s,
+        max_retries=max_retries,
     )
     report_markdown = build_agent_markdown_report(context, llm_assessment)
     return {

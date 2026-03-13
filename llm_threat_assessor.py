@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -49,7 +51,6 @@ def _resolve_provider_and_key(provider: str, api_key: Optional[str]) -> tuple[st
     if provider == "openai":
         return "openai", openai_key
 
-    # auto
     if deepseek_key:
         return "deepseek", deepseek_key
     if openai_key:
@@ -70,6 +71,27 @@ def _resolve_model(provider: str, model: str) -> str:
     return model
 
 
+def _request_chat_completion(
+    endpoint: str,
+    api_key: str,
+    payload: dict,
+    timeout_s: int,
+) -> str:
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body = resp.read().decode("utf-8")
+        obj = json.loads(body)
+        return obj["choices"][0]["message"]["content"].strip()
+
+
 def generate_threat_assessment(
     alerts_df: Optional[pd.DataFrame],
     anomalies_df: Optional[pd.DataFrame],
@@ -77,7 +99,8 @@ def generate_threat_assessment(
     provider: str = "auto",
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
-    timeout_s: int = 30,
+    timeout_s: int = 60,
+    max_retries: int = 2,
 ) -> str:
     """
     Generate threat assessment text.
@@ -85,7 +108,6 @@ def generate_threat_assessment(
     """
     provider = (provider or "auto").strip().lower()
     chosen_provider, chosen_key = _resolve_provider_and_key(provider, api_key)
-
     if not chosen_key:
         return _local_fallback_summary(alerts_df, anomalies_df, reason="未配置可用 API Key")
 
@@ -110,7 +132,6 @@ def generate_threat_assessment(
     )
 
     resolved_model = _resolve_model(chosen_provider, model)
-
     payload = {
         "model": resolved_model,
         "messages": [
@@ -119,7 +140,6 @@ def generate_threat_assessment(
         ],
         "temperature": 0.2,
     }
-    data = json.dumps(payload).encode("utf-8")
 
     if base_url:
         endpoint = base_url.rstrip("/")
@@ -130,29 +150,37 @@ def generate_threat_assessment(
             else "https://api.openai.com/v1/chat/completions"
         )
 
-    req = urllib.request.Request(
-        endpoint,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {chosen_key}",
-        },
-        method="POST",
+    attempt = 0
+    last_err = ""
+    while attempt <= max(0, int(max_retries)):
+        try:
+            return _request_chat_completion(
+                endpoint=endpoint,
+                api_key=chosen_key,
+                payload=payload,
+                timeout_s=max(5, int(timeout_s)),
+            )
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                err_body = ""
+            reason = f"HTTP {e.code}"
+            if err_body:
+                reason = f"{reason}: {err_body[:240]}"
+            return _local_fallback_summary(alerts_df, anomalies_df, reason=reason)
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            last_err = str(e)
+            if attempt >= max_retries:
+                break
+            time.sleep(min(3.0, 0.8 * (2 ** attempt)))
+        except Exception as e:
+            return _local_fallback_summary(alerts_df, anomalies_df, reason=str(e))
+        attempt += 1
+
+    return _local_fallback_summary(
+        alerts_df,
+        anomalies_df,
+        reason=f"请求超时/网络异常（已重试{max_retries + 1}次）：{last_err}",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read().decode("utf-8")
-            obj = json.loads(body)
-            return obj["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            err_body = ""
-        reason = f"HTTP {e.code}"
-        if err_body:
-            reason = f"{reason}: {err_body[:200]}"
-        return _local_fallback_summary(alerts_df, anomalies_df, reason=reason)
-    except Exception as e:
-        return _local_fallback_summary(alerts_df, anomalies_df, reason=str(e))

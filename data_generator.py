@@ -33,6 +33,21 @@ class DataGenerator:
         self.faker = Faker()
         Faker.seed(seed)
 
+    def get_attack_catalog(self):
+        """Return supported synthetic attack types and UI description."""
+        return {
+            'port_scan': '端口扫描（高频低载荷）',
+            'brute_force': '暴力破解（重复短连接）',
+            'data_exfiltration': '数据外传（大字节/长时）',
+            'dos': 'DoS突发（短时高压）',
+            'dns_tunnel': 'DNS隧道样式（长域名高频）',
+            'slow_scan': '低慢扫描（规避型）',
+            'periodic_beacon': '周期心跳（带抖动）',
+            'lateral_movement': '横向移动（内网多目标）',
+            'protocol_mismatch': '协议伪装（端口-协议不匹配）',
+            'low_slow_exfiltration': '低慢外传（小包长时）',
+        }
+
     def generate_synthetic_flows(self, n_normal=1000, n_attack=200, attack_types=None):
         """
         Generate synthetic network flows with normal and attack patterns
@@ -52,7 +67,7 @@ class DataGenerator:
             DataFrame containing synthetic network flows
         """
         # Define attack types if not provided
-        if attack_types is None:
+        if not attack_types:
             attack_types = ['port_scan', 'brute_force', 'data_exfiltration', 'dos']
 
         now = datetime.datetime.now()
@@ -107,74 +122,256 @@ class DataGenerator:
                 'attack_type': None
             })
 
-        # Attack traffic
-        for _ in range(n_attack):
-            ts = now + datetime.timedelta(seconds=np.random.randint(0, 3600))
-            attack_type = np.random.choice(attack_types)
+        # Attack traffic (rule-aligned generation)
+        hotspot_src = [self.faker.ipv4_private() for _ in range(5)]
+        hotspot_dst = [self.faker.ipv4_private() for _ in range(10)]
+        public_targets = [self.faker.ipv4_public() for _ in range(12)]
+        common_scan_ports = [21, 22, 23, 25, 53, 80, 110, 123, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9001]
+
+        def _make_record(ts, src_ip, dst_ip, src_port, dst_port, protocol, duration_ms, total_bytes, packet_count, tcp_flags, attack_type, l7_protocol=None, dns_query=None, dns_rcode=None):
+            return {
+                'timestamp': ts,
+                'src_ip': src_ip,
+                'dst_ip': dst_ip,
+                'src_port': src_port,
+                'dst_port': dst_port,
+                'protocol': protocol,
+                'duration_ms': duration_ms,
+                'total_bytes': total_bytes,
+                'packet_count': packet_count,
+                'tcp_flags': tcp_flags,
+                'label': 'attack',
+                'attack_type': attack_type,
+                'l7_protocol': l7_protocol,
+                'dns_query': dns_query,
+                'dns_rcode': dns_rcode,
+            }
+
+        def _random_dns_query():
+            sub = ''.join(np.random.choice(list('abcdefghijklmnopqrstuvwxyz0123456789'), size=np.random.randint(12, 28)))
+            return f"{sub}.{self.faker.domain_name()}"
+
+        attack_counts = {}
+        if n_attack > 0 and attack_types:
+            base = n_attack // len(attack_types)
+            rem = n_attack % len(attack_types)
+            for idx, attack_type in enumerate(attack_types):
+                attack_counts[attack_type] = base + (1 if idx < rem else 0)
+
+        for attack_type in attack_types:
+            remaining = int(attack_counts.get(attack_type, 0))
+            if remaining <= 0:
+                continue
+
+            # Spread scenarios across the hour so incidents can form and be separated.
+            scenario_anchor = now + datetime.timedelta(seconds=int(np.random.randint(0, 3300)))
+            anchor_src = str(np.random.choice(hotspot_src))
+            anchor_dst = str(np.random.choice(hotspot_dst))
+            anchor_public = str(np.random.choice(public_targets))
 
             if attack_type == 'port_scan':
-                records.append({
-                    'timestamp': ts,
-                    'src_ip': self.faker.ipv4_private(),
-                    'dst_ip': self.faker.ipv4_private(),
-                    'src_port': np.random.randint(1024, 65535),
-                    'dst_port': np.random.randint(1, 1024),  # Scanning low ports
-                    'protocol': 'TCP',
-                    'duration_ms': np.random.exponential(scale=5),  # Very short duration
-                    'total_bytes': np.random.randint(40, 60),  # Small packets
-                    'packet_count': 1,
-                    'tcp_flags': 'SYN',  # Typical for port scans
-                    'label': 'attack',
-                    'attack_type': 'port_scan'
-                })
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(24, 72)))
+                    window_start = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 180)))
+                    ports = np.random.choice(range(1, 4096), size=cluster_size, replace=False)
+                    for port in ports:
+                        ts = window_start + datetime.timedelta(seconds=float(np.random.uniform(0, 45)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_dst,
+                            int(np.random.randint(1024, 65535)), int(port),
+                            'TCP', float(np.random.exponential(scale=6)),
+                            int(np.random.randint(40, 80)), 1, 'SYN', 'port_scan'
+                        ))
+                    remaining -= cluster_size
+
+            elif attack_type == 'slow_scan':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(12, 36)))
+                    window_start = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 240)))
+                    ports = np.random.choice(common_scan_ports, size=cluster_size, replace=True)
+                    for port in ports:
+                        ts = window_start + datetime.timedelta(seconds=float(np.random.uniform(0, 110)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_dst,
+                            int(np.random.randint(1024, 65535)), int(port),
+                            np.random.choice(['TCP', 'UDP'], p=[0.75, 0.25]),
+                            float(np.random.exponential(scale=16)),
+                            int(np.random.randint(48, 140)), 1, 'SYN', 'slow_scan'
+                        ))
+                    remaining -= cluster_size
 
             elif attack_type == 'brute_force':
-                records.append({
-                    'timestamp': ts,
-                    'src_ip': self.faker.ipv4_private(),
-                    'dst_ip': self.faker.ipv4_private(),
-                    'src_port': np.random.randint(1024, 65535),
-                    'dst_port': np.random.choice([22, 23, 3389, 5900]),  # SSH, Telnet, RDP, VNC
-                    'protocol': 'TCP',
-                    'duration_ms': np.random.exponential(scale=50),
-                    'total_bytes': np.random.randint(60, 200),
-                    'packet_count': np.random.randint(1, 3),
-                    'tcp_flags': np.random.choice(['SYN', 'SYN-ACK', 'ACK']),
-                    'label': 'attack',
-                    'attack_type': 'brute_force'
-                })
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(18, 64)))
+                    target_port = int(np.random.choice([22, 23, 3389, 5900]))
+                    window_start = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 240)))
+                    for _ in range(cluster_size):
+                        ts = window_start + datetime.timedelta(seconds=float(np.random.uniform(0, 50)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_dst,
+                            int(np.random.randint(1024, 65535)), target_port,
+                            'TCP', float(np.random.exponential(scale=35)),
+                            int(np.random.randint(60, 220)),
+                            int(np.random.randint(1, 3)),
+                            str(np.random.choice(['SYN', 'SYN-ACK', 'ACK'])),
+                            'brute_force'
+                        ))
+                    remaining -= cluster_size
 
-            elif attack_type == 'data_exfiltration':
-                records.append({
-                    'timestamp': ts,
-                    'src_ip': self.faker.ipv4_private(),
-                    'dst_ip': self.faker.ipv4_public(),  # External destination
-                    'src_port': np.random.randint(1024, 65535),
-                    'dst_port': np.random.choice([80, 443, 53]),  # Common ports for hiding exfiltration
-                    'protocol': np.random.choice(['TCP', 'UDP']),
-                    'duration_ms': np.random.exponential(scale=300),
-                    'total_bytes': np.random.randint(10000, 100000),  # Large data transfer
-                    'packet_count': np.random.randint(10, 100),
-                    'tcp_flags': 'PSH-ACK' if np.random.random() < 0.8 else 'ACK',
-                    'label': 'attack',
-                    'attack_type': 'data_exfiltration'
-                })
+            elif attack_type == 'dns_tunnel':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(24, 80)))
+                    window_start = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 240)))
+                    for _ in range(cluster_size):
+                        ts = window_start + datetime.timedelta(seconds=float(np.random.uniform(0, 55)))
+                        rcode = 3 if np.random.random() < 0.35 else 0
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_public,
+                            int(np.random.randint(1024, 65535)), 53,
+                            'UDP', float(np.random.exponential(scale=90)),
+                            int(np.random.randint(220, 2000)),
+                            int(np.random.randint(2, 20)),
+                            '', 'dns_tunnel',
+                            l7_protocol='DNS',
+                            dns_query=_random_dns_query(),
+                            dns_rcode=rcode
+                        ))
+                    remaining -= cluster_size
+
+            elif attack_type == 'periodic_beacon':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(8, 24)))
+                    interval_s = float(np.random.choice([8, 10, 12, 15]))
+                    start_time = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 300)))
+                    for idx in range(cluster_size):
+                        jitter = float(np.random.uniform(-1.0, 1.0))
+                        ts = start_time + datetime.timedelta(seconds=(idx * interval_s + jitter))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_public,
+                            int(np.random.randint(1024, 65535)),
+                            int(np.random.choice([443, 8080, 9001])),
+                            str(np.random.choice(['TCP', 'UDP'], p=[0.65, 0.35])),
+                            float(np.random.exponential(scale=45)),
+                            int(np.random.randint(80, 420)),
+                            int(np.random.randint(1, 4)),
+                            str(np.random.choice(['ACK', 'PSH-ACK', ''])),
+                            'periodic_beacon'
+                        ))
+                    remaining -= cluster_size
 
             elif attack_type == 'dos':
-                records.append({
-                    'timestamp': ts,
-                    'src_ip': self.faker.ipv4_private(),
-                    'dst_ip': self.faker.ipv4_private(),
-                    'src_port': np.random.randint(1024, 65535),
-                    'dst_port': np.random.choice([80, 443, 8080, 25, 53]),
-                    'protocol': np.random.choice(['TCP', 'UDP', 'ICMP'], p=[0.6, 0.2, 0.2]),
-                    'duration_ms': np.random.exponential(scale=10),  # Very short connections
-                    'total_bytes': np.random.randint(40, 100),  # Small packets
-                    'packet_count': np.random.randint(1, 3),
-                    'tcp_flags': 'SYN' if np.random.random() < 0.7 else np.random.choice(['RST', 'FIN', '']),
-                    'label': 'attack',
-                    'attack_type': 'dos'
-                })
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(24, 90)))
+                    base_window = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 240)))
+
+                    # Create two low-load windows, then one burst window for TRAFFIC_BURST rule.
+                    baseline_points = min(cluster_size // 4, 12)
+                    for _ in range(baseline_points):
+                        ts = base_window + datetime.timedelta(seconds=float(np.random.uniform(0, 110)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_dst,
+                            int(np.random.randint(1024, 65535)),
+                            int(np.random.choice([80, 443, 8080, 53])),
+                            str(np.random.choice(['TCP', 'UDP', 'ICMP'], p=[0.6, 0.25, 0.15])),
+                            float(np.random.exponential(scale=20)),
+                            int(np.random.randint(800, 3500)),
+                            int(np.random.randint(1, 4)),
+                            str(np.random.choice(['SYN', 'ACK', ''])),
+                            'dos'
+                        ))
+
+                    burst_points = cluster_size - baseline_points
+                    burst_window = base_window + datetime.timedelta(seconds=120)
+                    for _ in range(burst_points):
+                        ts = burst_window + datetime.timedelta(seconds=float(np.random.uniform(0, 40)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_dst,
+                            int(np.random.randint(1024, 65535)),
+                            int(np.random.choice([80, 443, 8080, 53])),
+                            str(np.random.choice(['TCP', 'UDP', 'ICMP'], p=[0.7, 0.2, 0.1])),
+                            float(np.random.exponential(scale=10)),
+                            int(np.random.randint(3000, 14000)),
+                            int(np.random.randint(2, 8)),
+                            'SYN',
+                            'dos'
+                        ))
+                    remaining -= cluster_size
+
+            elif attack_type == 'data_exfiltration':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(10, 36)))
+                    start_time = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 280)))
+                    for _ in range(cluster_size):
+                        ts = start_time + datetime.timedelta(seconds=float(np.random.uniform(0, 100)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_public,
+                            int(np.random.randint(1024, 65535)),
+                            int(np.random.choice([443, 80, 53])),
+                            str(np.random.choice(['TCP', 'UDP'], p=[0.7, 0.3])),
+                            float(np.random.exponential(scale=420)),
+                            int(np.random.randint(12000, 120000)),
+                            int(np.random.randint(12, 120)),
+                            str(np.random.choice(['PSH-ACK', 'ACK'])),
+                            'data_exfiltration'
+                        ))
+                    remaining -= cluster_size
+
+            elif attack_type == 'lateral_movement':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(10, 40)))
+                    start_time = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 300)))
+                    for _ in range(cluster_size):
+                        ts = start_time + datetime.timedelta(seconds=float(np.random.uniform(0, 70)))
+                        records.append(_make_record(
+                            ts, anchor_src, str(np.random.choice(hotspot_dst)),
+                            int(np.random.randint(1024, 65535)),
+                            int(np.random.choice([135, 139, 445, 3389, 5985, 22])),
+                            'TCP',
+                            float(np.random.exponential(scale=90)),
+                            int(np.random.randint(120, 2600)),
+                            int(np.random.randint(2, 20)),
+                            str(np.random.choice(['SYN', 'SYN-ACK', 'ACK'])),
+                            'lateral_movement'
+                        ))
+                    remaining -= cluster_size
+
+            elif attack_type == 'protocol_mismatch':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(8, 30)))
+                    start_time = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 300)))
+                    for _ in range(cluster_size):
+                        proto = str(np.random.choice(['ICMP', 'UDP']))
+                        dst_port = int(np.random.choice([53, 80, 443, 22, 3389, 3306])) if proto != 'ICMP' else 0
+                        src_port = 0 if proto == 'ICMP' else int(np.random.randint(1024, 65535))
+                        ts = start_time + datetime.timedelta(seconds=float(np.random.uniform(0, 70)))
+                        records.append(_make_record(
+                            ts, anchor_src, str(np.random.choice(hotspot_dst)),
+                            src_port, dst_port, proto,
+                            float(np.random.exponential(scale=25)),
+                            int(np.random.randint(60, 700)),
+                            int(np.random.randint(1, 6)),
+                            '', 'protocol_mismatch'
+                        ))
+                    remaining -= cluster_size
+
+            elif attack_type == 'low_slow_exfiltration':
+                while remaining > 0:
+                    cluster_size = int(min(remaining, np.random.randint(12, 42)))
+                    start_time = scenario_anchor + datetime.timedelta(seconds=int(np.random.randint(0, 300)))
+                    for _ in range(cluster_size):
+                        ts = start_time + datetime.timedelta(seconds=float(np.random.uniform(0, 300)))
+                        records.append(_make_record(
+                            ts, anchor_src, anchor_public,
+                            int(np.random.randint(1024, 65535)),
+                            int(np.random.choice([443, 53, 8080])),
+                            str(np.random.choice(['TCP', 'UDP'])),
+                            float(np.random.exponential(scale=2400)),
+                            int(np.random.randint(700, 10000)),
+                            int(np.random.randint(8, 80)),
+                            str(np.random.choice(['PSH-ACK', 'ACK', ''])),
+                            'low_slow_exfiltration'
+                        ))
+                    remaining -= cluster_size
 
         df = pd.DataFrame(records)
 

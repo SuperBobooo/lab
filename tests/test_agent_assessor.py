@@ -15,13 +15,7 @@ def test_agent_context_and_report_generation_local_fallback():
             {"flow_id": 2, "timestamp": "2026-03-08T10:00:01", "src_ip": "10.0.0.2", "dst_ip": "1.1.1.1", "protocol": "TCP", "score_iso_norm": 0.12},
         ]
     )
-    packets_df = pd.DataFrame(
-        [
-            {"protocol": "TCP"},
-            {"protocol": "UDP"},
-            {"protocol": "ARP"},
-        ]
-    )
+    packets_df = pd.DataFrame([{"protocol": "TCP"}, {"protocol": "UDP"}, {"protocol": "ARP"}])
     alerts_df = pd.DataFrame(
         [
             {"timestamp": "2026-03-08T10:00:10", "rule_name": "PORT_SCAN", "severity": "high", "src_ip": "10.0.0.1", "dst_ip": "MULTI", "evidence": "{}"}
@@ -58,3 +52,4 @@ def test_agent_context_and_report_generation_local_fallback():
     )
     assert "AI 智能研判 Agent 报告" in result["report_markdown"]
     assert "本地研判" in result["llm_assessment"]
+

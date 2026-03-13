@@ -15,7 +15,7 @@ import json
 import pandas as pd
 
 
-def _top_value_counts(df: pd.DataFrame, col: str, topn: int = 5) -> list[tuple[str, int]]:
+def _top_value_counts(df: Optional[pd.DataFrame], col: str, topn: int = 5) -> list[tuple[str, int]]:
     if df is None or df.empty or col not in df.columns:
         return []
     vc = df[col].astype(str).value_counts().head(topn)
@@ -44,12 +44,96 @@ def _evidence_summary(evidence_text: object) -> str:
     try:
         data = json.loads(text)
     except Exception:
-        return text[:80]
-    keys = ["window_start", "window_end", "flow_count", "attempt_count", "unique_queries", "nxdomain_count", "arp_packet_count"]
+        return text[:120]
+    keys = [
+        "window_start",
+        "window_end",
+        "flow_count",
+        "attempt_count",
+        "unique_queries",
+        "nxdomain_count",
+        "arp_packet_count",
+    ]
     parts = [f"{k}={data[k]}" for k in keys if k in data]
-    if not parts:
-        return text[:80]
-    return "; ".join(parts)
+    return "; ".join(parts) if parts else text[:120]
+
+
+def _is_local_llm_fallback(llm_assessment: str) -> bool:
+    t = (llm_assessment or "").strip()
+    return t.startswith("【本地研判")
+
+
+def _has_meaningful_agent_appendix(agent_report_markdown: str) -> bool:
+    t = (agent_report_markdown or "").strip()
+    if not t:
+        return False
+    if ("规则告警数：0" in t or "规则告警数: 0" in t) and ("事件数：0" in t or "事件数: 0" in t):
+        return False
+    return True
+
+
+def _build_status_section(
+    analysis_df: Optional[pd.DataFrame],
+    rule_alerts_df: Optional[pd.DataFrame],
+    incident_df: Optional[pd.DataFrame],
+    action_df: Optional[pd.DataFrame],
+) -> list[str]:
+    lines = ["## 零、数据与执行状态", ""]
+    lines.append(f"- 流量特征状态：{'可用' if analysis_df is not None and not analysis_df.empty else '为空'}")
+    if rule_alerts_df is None:
+        lines.append("- 规则检测状态：未执行（建议点击“执行规则检测”后再导出）")
+    elif rule_alerts_df.empty:
+        lines.append("- 规则检测状态：已执行，当前未命中规则告警")
+    else:
+        lines.append(f"- 规则检测状态：已执行，命中 {len(rule_alerts_df)} 条告警")
+
+    if incident_df is None:
+        lines.append("- 事件聚合状态：未执行或无输入")
+    elif incident_df.empty:
+        lines.append("- 事件聚合状态：已执行，当前无聚合事件")
+    else:
+        lines.append(f"- 事件聚合状态：已执行，聚合 {len(incident_df)} 起事件")
+
+    lines.append(
+        f"- 响应动作状态：{'无记录' if action_df is None or action_df.empty else f'已有 {len(action_df)} 条记录'}"
+    )
+    lines.append("")
+    return lines
+
+
+def _build_recommendation_section(
+    rule_alerts_df: Optional[pd.DataFrame],
+    incident_df: Optional[pd.DataFrame],
+    analysis_df: Optional[pd.DataFrame],
+) -> list[str]:
+    lines = ["## 五、处置建议", ""]
+    total_alerts = int(len(rule_alerts_df)) if isinstance(rule_alerts_df, pd.DataFrame) else 0
+    total_incidents = int(len(incident_df)) if isinstance(incident_df, pd.DataFrame) else 0
+
+    if total_alerts == 0 and total_incidents == 0:
+        lines.extend(
+            [
+                "- 当前未见明确规则攻击信号，建议先保留本次快照作为基线样本。",
+                "- 建议在受控实验中注入已知攻击流（端口扫描/DNS异常/ARP样本）验证检测灵敏度。",
+                "- 若要触发更稳定的 AI 研判，建议延长抓包时长并提高流量多样性。",
+                "",
+            ]
+        )
+        return lines
+
+    lines.extend(
+        [
+            "- 优先处置高风险事件对应的源IP，并结合终端日志进行溯源。",
+            "- 对 DNS 异常与 ARP 异常同时出现的主机执行网络隔离与资产核验。",
+            "- 对周期性心跳/低慢扫描行为启用更长窗口监控与白名单核验。",
+        ]
+    )
+
+    if isinstance(analysis_df, pd.DataFrame) and "score_ensemble_norm" in analysis_df.columns:
+        high_anom = int((analysis_df["score_ensemble_norm"].fillna(0) >= 0.8).sum())
+        lines.append(f"- 高异常分（>=0.8）流量数量：{high_anom}，建议人工复核 Top 异常流。")
+    lines.append("")
+    return lines
 
 
 def build_markdown_report(
@@ -80,22 +164,22 @@ def build_markdown_report(
         f"- 聚合事件总数：{total_incidents}",
         f"- 响应动作记录数：{total_actions}",
         "",
-        "## 一、规则告警概览",
-        "",
     ]
 
-    if rule_alerts_df is None or rule_alerts_df.empty:
+    lines.extend(_build_status_section(analysis_df, rule_alerts_df, incident_df, action_df))
+
+    lines.extend(["## 一、规则告警概览", ""])
+    if rule_alerts_df is None:
+        lines.extend(["- 规则检测尚未执行。", ""])
+    elif rule_alerts_df.empty:
         lines.extend(["- 当前无规则告警。", ""])
     else:
         for rule, count in _top_value_counts(rule_alerts_df, "rule_name", topn=10):
             lines.append(f"- {rule}: {count}")
-        lines.append("")
-        lines.append("### 告警明细（前10条）")
-        lines.append("")
+        lines.extend(["", "### 告警明细（前10条）", ""])
         lines.append("| 时间 | 规则 | 严重级别 | 源IP | 目标IP | 证据摘要 |")
         lines.append("|---|---|---|---|---|---|")
-        top10 = rule_alerts_df.head(10)
-        for _, row in top10.iterrows():
+        for _, row in rule_alerts_df.head(10).iterrows():
             lines.append(
                 f"| {row.get('timestamp', '')} | {row.get('rule_name', '')} | "
                 f"{row.get('severity', '')} | {row.get('src_ip', '')} | "
@@ -104,7 +188,9 @@ def build_markdown_report(
         lines.append("")
 
     lines.extend(["## 二、事件链概览", ""])
-    if incident_df is None or incident_df.empty:
+    if incident_df is None:
+        lines.extend(["- 事件聚合尚未执行。", ""])
+    elif incident_df.empty:
         lines.extend(["- 当前无聚合事件。", ""])
     else:
         lines.append("| 事件ID | 阶段 | 源IP | 风险分 | 最高级别 | 告警数 | 规则链 |")
@@ -131,6 +217,20 @@ def build_markdown_report(
         if "score_ensemble_norm" in analysis_df.columns:
             mean_ensemble = float(analysis_df["score_ensemble_norm"].fillna(0).mean())
             lines.append(f"- 集成模型平均异常分数：{mean_ensemble:.4f}")
+
+        score_col = "score_ensemble_norm" if "score_ensemble_norm" in analysis_df.columns else (
+            "score_iso_norm" if "score_iso_norm" in analysis_df.columns else None
+        )
+        if score_col:
+            top_anom = analysis_df.sort_values(score_col, ascending=False).head(5)
+            lines.extend(["", f"### 高异常流量 Top5（按 {score_col}）", ""])
+            lines.append("| 时间 | 源IP | 目标IP | 协议 | 目标端口 | 异常分数 |")
+            lines.append("|---|---|---|---|---:|---:|")
+            for _, row in top_anom.iterrows():
+                lines.append(
+                    f"| {row.get('timestamp', '')} | {row.get('src_ip', '')} | {row.get('dst_ip', '')} | "
+                    f"{row.get('protocol', '')} | {row.get('dst_port', '')} | {float(row.get(score_col, 0)):.4f} |"
+                )
         lines.append("")
 
     lines.extend(["## 四、响应动作审计", ""])
@@ -146,21 +246,38 @@ def build_markdown_report(
             )
         lines.append("")
 
-    lines.extend(
-        [
-            "## 五、处置建议",
-            "- 优先处置高风险事件对应的源IP，并结合终端日志进行溯源。",
-            "- 对 DNS 异常与 ARP 异常同时出现的主机执行网络隔离与资产核验。",
-            "- 对周期性心跳/低慢扫描行为启用更长窗口监控与白名单核验。",
-            "",
-        ]
-    )
+    lines.extend(_build_recommendation_section(rule_alerts_df, incident_df, analysis_df))
 
-    if llm_assessment:
-        lines.extend(["## 六、LLM 威胁研判", "", llm_assessment.strip(), ""])
+    llm_text = (llm_assessment or "").strip()
+    agent_text = (agent_report_markdown or "").strip()
 
-    if agent_report_markdown:
-        lines.extend(["## 七、AI Agent 综合研判附录", "", agent_report_markdown.strip(), ""])
+    append_llm = bool(llm_text)
+    if append_llm and agent_text and llm_text in agent_text:
+        append_llm = False
+
+    if append_llm:
+        lines.extend(["## 六、LLM 威胁研判", "", llm_text, ""])
+        if _is_local_llm_fallback(llm_text):
+            lines.extend(
+                [
+                    "> 说明：本次为本地兜底研判（未调用外部LLM）。",
+                    "> 如需真实大模型研判，请配置 DEEPSEEK_API_KEY 或在页面输入 API Key。",
+                    "",
+                ]
+            )
+
+    if agent_text:
+        if _has_meaningful_agent_appendix(agent_text):
+            lines.extend(["## 七、AI Agent 综合研判附录", "", agent_text, ""])
+        else:
+            lines.extend(
+                [
+                    "## 七、AI Agent 综合研判附录",
+                    "",
+                    "- 本次 Agent 附录未提供额外高价值信息（规则/事件为空），已省略详细内容。",
+                    "",
+                ]
+            )
 
     return "\n".join(lines)
 
@@ -286,3 +403,4 @@ def markdown_to_pdf_bytes(markdown_text: str) -> Tuple[Optional[bytes], Optional
         return None, f"PDF 渲染失败: {e}"
 
     return buf.getvalue(), None
+
